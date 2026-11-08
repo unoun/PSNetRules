@@ -1,0 +1,13 @@
+# Machine-specific management state and current OS snapshot
+*.state.json
+*.snapshot.json
+
+# Generated PowerShell execution plans
+*.generate.ps1
+
+# Backups and test outputs
+backups/
+coverage/
+
+# In-progress staged management-file updates
+*.unmanage.*.tmp

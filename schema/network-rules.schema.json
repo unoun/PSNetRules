@@ -1,0 +1,560 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/netrules/network-rules.schema.json",
+  "title": "PSNetRules desired-state configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "firewallProfiles",
+    "firewallDynamicKeywordAddresses",
+    "firewallRules",
+    "nrptRules"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "firewallProfiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Domain",
+        "Private",
+        "Public"
+      ],
+      "properties": {
+        "Domain": {
+          "$ref": "#/$defs/firewallProfile"
+        },
+        "Private": {
+          "$ref": "#/$defs/firewallProfile"
+        },
+        "Public": {
+          "$ref": "#/$defs/firewallProfile"
+        }
+      }
+    },
+    "firewallRules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/firewallRule"
+      }
+    },
+    "excludedFirewallRules": {
+      "type": "array",
+      "description": "Firewall rule Names explicitly excluded from management. The property is optional for backwards compatibility.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "nrptRules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/nrptRule"
+      }
+    },
+    "firewallDynamicKeywordAddresses": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/firewallDynamicKeywordAddress"
+      }
+    }
+  },
+  "$defs": {
+    "nullableString": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nullableBoolean": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "nullableStringArray": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "firewallProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Enabled",
+        "DefaultInboundAction",
+        "DefaultOutboundAction",
+        "AllowInboundRules",
+        "AllowLocalFirewallRules",
+        "AllowLocalIPsecRules",
+        "AllowUserApps",
+        "AllowUserPorts",
+        "AllowUnicastResponseToMulticast",
+        "NotifyOnListen",
+        "EnableStealthModeForIPsec",
+        "LogFileName",
+        "LogMaxSizeKilobytes",
+        "LogAllowed",
+        "LogBlocked",
+        "LogIgnored",
+        "DisabledInterfaceAliases"
+      ],
+      "properties": {
+        "Enabled": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "DefaultInboundAction": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "DefaultOutboundAction": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowInboundRules": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowLocalFirewallRules": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowLocalIPsecRules": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowUserApps": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowUserPorts": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "AllowUnicastResponseToMulticast": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "NotifyOnListen": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "EnableStealthModeForIPsec": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "LogFileName": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "LogMaxSizeKilobytes": {
+          "type": [
+            "integer",
+            "number",
+            "null"
+          ]
+        },
+        "LogAllowed": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "LogBlocked": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "LogIgnored": {
+          "$ref": "#/$defs/nullableScalar"
+        },
+        "DisabledInterfaceAliases": {
+          "$ref": "#/$defs/nullableStringArray"
+        }
+      }
+    },
+    "firewallRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "rule",
+        "filters"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "name",
+            "DisplayName",
+            "Description",
+            "Group",
+            "Enabled",
+            "Profile",
+            "Platform",
+            "Direction",
+            "Action",
+            "EdgeTraversalPolicy",
+            "LooseSourceMapping",
+            "LocalOnlyMapping",
+            "Owner",
+            "RemoteDynamicKeywordAddresses"
+          ],
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "DisplayName": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "Description": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "Group": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "Enabled": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "Profile": {
+              "type": [
+                "array",
+                "string",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              }
+            },
+            "Platform": {
+              "$ref": "#/$defs/nullableStringArray"
+            },
+            "Direction": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "Action": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "EdgeTraversalPolicy": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "LooseSourceMapping": {
+              "$ref": "#/$defs/nullableBoolean"
+            },
+            "LocalOnlyMapping": {
+              "$ref": "#/$defs/nullableBoolean"
+            },
+            "Owner": {
+              "$ref": "#/$defs/nullableString"
+            },
+            "RemoteDynamicKeywordAddresses": {
+              "$ref": "#/$defs/nullableStringArray"
+            }
+          }
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "address",
+            "port",
+            "application",
+            "service",
+            "interface",
+            "interfaceType",
+            "security"
+          ],
+          "properties": {
+            "address": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "LocalAddress",
+                "RemoteAddress"
+              ],
+              "properties": {
+                "LocalAddress": {
+                  "$ref": "#/$defs/nullableStringArray"
+                },
+                "RemoteAddress": {
+                  "$ref": "#/$defs/nullableStringArray"
+                }
+              }
+            },
+            "port": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "Protocol",
+                "LocalPort",
+                "RemotePort",
+                "IcmpType",
+                "DynamicTarget"
+              ],
+              "properties": {
+                "Protocol": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "LocalPort": {
+                  "$ref": "#/$defs/nullableStringArray"
+                },
+                "RemotePort": {
+                  "$ref": "#/$defs/nullableStringArray"
+                },
+                "IcmpType": {
+                  "$ref": "#/$defs/nullableStringArray"
+                },
+                "DynamicTarget": {
+                  "$ref": "#/$defs/nullableString"
+                }
+              }
+            },
+            "application": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "Program",
+                "Package"
+              ],
+              "properties": {
+                "Program": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "Package": {
+                  "$ref": "#/$defs/nullableString"
+                }
+              }
+            },
+            "service": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "Service"
+              ],
+              "properties": {
+                "Service": {
+                  "$ref": "#/$defs/nullableString"
+                }
+              }
+            },
+            "interface": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "InterfaceAlias"
+              ],
+              "properties": {
+                "InterfaceAlias": {
+                  "$ref": "#/$defs/nullableStringArray"
+                }
+              }
+            },
+            "interfaceType": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "InterfaceType"
+              ],
+              "properties": {
+                "InterfaceType": {
+                  "type": [
+                    "array",
+                    "string",
+                    "null"
+                  ],
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "security": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "LocalUser",
+                "RemoteUser",
+                "RemoteMachine",
+                "Authentication",
+                "Encryption",
+                "OverrideBlockRules"
+              ],
+              "properties": {
+                "LocalUser": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "RemoteUser": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "RemoteMachine": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "Authentication": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "Encryption": {
+                  "$ref": "#/$defs/nullableString"
+                },
+                "OverrideBlockRules": {
+                  "$ref": "#/$defs/nullableBoolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "nrptRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "Namespace",
+        "IPsecTrustAuthority",
+        "DANameServers",
+        "DAEnable",
+        "DAIPsecEncryptionType",
+        "DAIPsecRequired",
+        "DAProxyServerName",
+        "DAProxyType",
+        "NameServers",
+        "NameEncoding",
+        "DnsSecEnable",
+        "DnsSecIPsecEncryptionType",
+        "DnsSecIPsecRequired",
+        "DnsSecValidationRequired",
+        "DisplayName",
+        "Comment"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "Namespace": {
+          "$ref": "#/$defs/nullableStringArray"
+        },
+        "IPsecTrustAuthority": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "DANameServers": {
+          "$ref": "#/$defs/nullableStringArray"
+        },
+        "DAEnable": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "DAIPsecEncryptionType": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "DAIPsecRequired": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "DAProxyServerName": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "DAProxyType": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "NameServers": {
+          "$ref": "#/$defs/nullableStringArray"
+        },
+        "NameEncoding": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "DnsSecEnable": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "DnsSecIPsecEncryptionType": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "DnsSecIPsecRequired": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "DnsSecValidationRequired": {
+          "$ref": "#/$defs/nullableBoolean"
+        },
+        "DisplayName": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "Comment": {
+          "$ref": "#/$defs/nullableString"
+        }
+      }
+    },
+    "nullableScalar": {
+      "type": [
+        "string",
+        "integer",
+        "number",
+        "boolean",
+        "null"
+      ]
+    },
+    "firewallDynamicKeywordAddress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "Keyword",
+        "Addresses",
+        "AutoResolve"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^\\{[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\\}$"
+        },
+        "Keyword": {
+          "type": "string",
+          "minLength": 1
+        },
+        "Addresses": {
+          "$ref": "#/$defs/nullableString"
+        },
+        "AutoResolve": {
+          "type": "boolean"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "AutoResolve": {
+                "const": true
+              }
+            },
+            "required": [
+              "AutoResolve"
+            ]
+          },
+          "then": {
+            "properties": {
+              "Addresses": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "AutoResolve": {
+                "const": false
+              }
+            },
+            "required": [
+              "AutoResolve"
+            ]
+          },
+          "then": {
+            "properties": {
+              "Addresses": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "description": "Desired local state for PSNetRules-managed Windows Firewall Rules, Firewall Profiles, Dynamic Keyword Addresses, and local DNS Client NRPT Rules. Firewall Rules are managed selectively; the profile, Dynamic Keyword Address, and NRPT collections describe their complete local desired state."
+}

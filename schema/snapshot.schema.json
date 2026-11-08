@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/netrules/snapshot.schema.json",
+  "title": "PSNetRules capture Snapshot",
+  "description": "Captured local configuration and Firewall Rule comparison inventories. Snapshot schema version 1 stores normalized comparison properties as Value fields; canonical comparison strings are calculated when needed and are not persisted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "capturedAt",
+    "computerName",
+    "configuration",
+    "comparison"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "capturedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "computerName": {
+      "type": "string",
+      "minLength": 1
+    },
+    "configuration": {
+      "$ref": "network-rules.schema.json"
+    },
+    "comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "persistentStore",
+        "systemDefaults",
+        "excludedProperties",
+        "arraySemantics",
+        "stringSemantics"
+      ],
+      "properties": {
+        "persistentStore": {
+          "$ref": "#/$defs/persistentStoreInventory"
+        },
+        "systemDefaults": {
+          "$ref": "#/$defs/systemDefaultsInventory"
+        },
+        "excludedProperties": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "arraySemantics": {
+          "const": "Array order is ignored; duplicate elements are retained."
+        },
+        "stringSemantics": {
+          "const": "String values are compared case-sensitively."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "persistentStoreInventory": {
+      "$ref": "#/$defs/comparisonInventory",
+      "description": "Comparison inventory captured from the local PersistentStore.",
+      "properties": {
+        "PolicyStore": {
+          "const": "PersistentStore"
+        }
+      }
+    },
+    "systemDefaultsInventory": {
+      "$ref": "#/$defs/comparisonInventory",
+      "description": "Comparison inventory captured from SystemDefaults.",
+      "properties": {
+        "PolicyStore": {
+          "const": "SystemDefaults"
+        }
+      }
+    },
+    "comparisonInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "PolicyStore",
+        "RuleCount",
+        "Entries",
+        "BulkFilterWarnings"
+      ],
+      "properties": {
+        "PolicyStore": {
+          "enum": [
+            "PersistentStore",
+            "SystemDefaults"
+          ]
+        },
+        "RuleCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "Entries": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/comparisonEntry"
+          }
+        },
+        "BulkFilterWarnings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/filterIssue"
+          }
+        }
+      }
+    },
+    "comparisonEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Name",
+        "IsComplete",
+        "MissingFilters",
+        "FilterIssues",
+        "Fields"
+      ],
+      "properties": {
+        "Name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "IsComplete": {
+          "type": "boolean"
+        },
+        "MissingFilters": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "FilterIssues": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/filterIssue"
+          }
+        },
+        "Fields": {
+          "type": "object",
+          "description": "Map of comparison property names to their normalized Value wrapper.",
+          "additionalProperties": {
+            "$ref": "#/$defs/comparisonField"
+          }
+        }
+      }
+    },
+    "filterIssue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Filter",
+        "Detail"
+      ],
+      "properties": {
+        "Filter": {
+          "type": "string",
+          "minLength": 1
+        },
+        "Detail": {
+          "type": "string"
+        }
+      }
+    },
+    "comparisonField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "Value"
+      ],
+      "properties": {
+        "Value": {}
+      }
+    }
+  }
+}

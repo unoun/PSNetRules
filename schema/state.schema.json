@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/netrules/state.schema.json",
+  "title": "PSNetRules State sidecar",
+  "description": "PSNetRules bookkeeping for managed Firewall Rules and logical-to-Windows NRPT Name mappings. State schema version 1 is the current sidecar format.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "nrptRules",
+    "managedFirewallRules"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "nrptRules": {
+      "type": "object",
+      "description": "Maps each PSNetRules NRPT logical ID to the corresponding Windows-generated rule Name.",
+      "propertyNames": {
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "managedFirewallRules": {
+      "type": "array",
+      "description": "Names of Firewall Rules explicitly adopted for management.",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}
