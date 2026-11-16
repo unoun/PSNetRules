@@ -77,7 +77,8 @@ function Test-NRObjectLike {
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
         # JSON objects deserialize as PSCustomObjects; inspect their property
         # collection directly in this frequently evaluated comparison path.
-        return (@($Value.PSObject.Properties).Count -gt 0)
+        foreach ($property in $Value.PSObject.Properties) { return $true }
+        return $false
     }
 
     # Adapted PowerShell objects use the general PSObject property path.
@@ -252,6 +253,51 @@ function Test-NRStringSequenceAgainstCounts {
     return (Test-NRStringSequenceCountsEmpty -Counts $Counts)
 }
 
+function Test-NRSequenceStringOrNullOnly {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object] $Value)
+
+    foreach ($item in $Value) {
+        if ($null -ne $item -and $item -isnot [string]) { return $false }
+    }
+    return $true
+}
+
+function Get-NRStringSequenceFastVerdict {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object] $Left,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object] $Right,
+        [Parameter(Mandatory = $true)] [int] $LeftCount,
+        [Parameter(Mandatory = $true)] [int] $RightCount
+    )
+
+    # Cheap verdicts that avoid building the counting dictionary. Returns
+    # 'Equal', 'NotEqual', 'Canonical' (the sequence is not string-only, so
+    # the caller must defer to the canonical comparison), or 'Counting'
+    # (no cheap verdict; the caller runs the full multiset comparison).
+    if ($LeftCount -ne $RightCount) {
+        # Multisets with different totals can only be unequal-or-deferred:
+        # when both sides contain nothing but strings and nulls they cannot
+        # be equal; any other element defers to the canonical path.
+        if (-not (Test-NRSequenceStringOrNullOnly -Value $Left)) { return 'Canonical' }
+        if (-not (Test-NRSequenceStringOrNullOnly -Value $Right)) { return 'Canonical' }
+        return 'NotEqual'
+    }
+    if ($LeftCount -eq 0) { return 'Equal' }
+    if ($LeftCount -gt 1) { return 'Counting' }
+
+    $leftItem = $Left[0]
+    $rightItem = $Right[0]
+    if ($leftItem -is [string] -and $rightItem -is [string]) {
+        if ($leftItem -ceq $rightItem) { return 'Equal' }
+        return 'NotEqual'
+    }
+    if ($null -eq $leftItem -and $null -eq $rightItem) { return 'Equal' }
+    if ($null -eq $leftItem -or $null -eq $rightItem) { return 'NotEqual' }
+    return 'Canonical'
+}
+
 function Test-NRStringSequenceEqual {
     [CmdletBinding()]
     param(
@@ -261,11 +307,17 @@ function Test-NRStringSequenceEqual {
 
     # Compare strings as an ordinal, case-sensitive multiset. Return null for
     # non-string sequences so the caller can use the general canonical path.
+    $leftCount = if ($Left -is [System.Array]) { $Left.Length } else { $Left.Count }
+    $rightCount = if ($Right -is [System.Array]) { $Right.Length } else { $Right.Count }
+
+    $fastVerdict = Get-NRStringSequenceFastVerdict -Left $Left -Right $Right -LeftCount $leftCount -RightCount $rightCount
+    if ($fastVerdict -eq 'Equal') { return $true }
+    if ($fastVerdict -eq 'NotEqual') { return $false }
+    if ($fastVerdict -eq 'Canonical') { return $null }
+
     $counts = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::Ordinal)
     $leftNullCount = Add-NRStringSequenceCounts -Value $Left -Counts $counts
     if ($null -eq $leftNullCount) { return $null }
-    $leftCount = if ($Left -is [System.Array]) { $Left.Length } else { $Left.Count }
-    $rightCount = if ($Right -is [System.Array]) { $Right.Length } else { $Right.Count }
     return (Test-NRStringSequenceAgainstCounts -Value $Right -Counts $counts `
         -ExpectedNullCount $leftNullCount -InitialEqual ($leftCount -eq $rightCount))
 }
@@ -339,7 +391,8 @@ function Test-NRPropertyValueObjectLike {
     param([AllowNull()] [object] $Value)
     if ($Value -is [System.Collections.IDictionary]) { return $true }
     if ($Value -is [System.Management.Automation.PSCustomObject]) {
-        return (@($Value.PSObject.Properties).Count -gt 0)
+        foreach ($property in $Value.PSObject.Properties) { return $true }
+        return $false
     }
     if ($null -eq $Value -or $Value -is [string] -or $Value -is [ValueType] -or
         $Value -is [System.Collections.IEnumerable]) { return $false }
@@ -362,25 +415,104 @@ function Test-NRCustomObjectPropertyValuesEqual {
     return (Test-NRCanonicalValuesEqual -Left $Left -Right $Right)
 }
 
+function Test-NRPropertyValuePairObjectLike {
+    [CmdletBinding()]
+    param([AllowNull()] [object] $OldValue, [AllowNull()] [object] $NewValue)
+
+    # One combined pass over both values, equivalent to
+    # (Test-NRPropertyValueObjectLike $OldValue) -or
+    # (Test-NRPropertyValueObjectLike $NewValue), with the common JSON
+    # shapes checked inline and anything else delegated.
+    foreach ($value in @($OldValue, $NewValue)) {
+        if ($value -is [System.Collections.IDictionary]) { return $true }
+        if ($value -is [System.Management.Automation.PSCustomObject]) {
+            foreach ($property in $value.PSObject.Properties) { return $true }
+            continue
+        }
+        if ($null -eq $value -or $value -is [string] -or $value -is [ValueType] -or
+            $value -is [System.Collections.IEnumerable]) { continue }
+        if (Test-NRPropertyValueObjectLike $value) { return $true }
+    }
+    return $false
+}
+
 function Get-NRPCustomObjectPropertyChange {
     [CmdletBinding()]
     param(
-        [AllowNull()] [object] $BeforeProperty,
-        [AllowNull()] [object] $AfterProperty,
+        [AllowNull()] [object] $OldValue,
+        [AllowNull()] [object] $NewValue,
         [string] $Name,
         [string] $Prefix = ''
     )
-    $oldValue = if ($null -ne $BeforeProperty) { $BeforeProperty.Value } else { $null }
-    $newValue = if ($null -ne $AfterProperty) { $AfterProperty.Value } else { $null }
     $path = if ([string]::IsNullOrEmpty($Prefix)) { $Name } else { "$Prefix.$Name" }
 
-    if ((Test-NRPropertyValueObjectLike $oldValue) -or (Test-NRPropertyValueObjectLike $newValue)) {
-        return (Get-NRObjectChanges -Before $oldValue -After $newValue -Prefix $path)
+    if (Test-NRPropertyValuePairObjectLike -OldValue $oldValue -NewValue $newValue) {
+        return (Get-NRPairObjectChanges -OldValue $oldValue -NewValue $newValue -Prefix $path)
     }
-    if (-not (Test-NRCustomObjectPropertyValuesEqual -Left $oldValue -Right $newValue)) {
+
+    # Leaf equality fast paths, in the same order
+    # Test-NRCustomObjectPropertyValuesEqual checks them; sequences and
+    # everything else still go through that function.
+    $equal = $null
+    if ($null -eq $oldValue -or $null -eq $newValue) {
+        $equal = ($null -eq $oldValue -and $null -eq $newValue)
+    }
+    elseif ($oldValue -is [string] -and $newValue -is [string]) { $equal = ($oldValue -ceq $newValue) }
+    elseif ($oldValue -is [bool] -and $newValue -is [bool]) { $equal = ($oldValue -eq $newValue) }
+    if ($null -eq $equal) { $equal = Test-NRCustomObjectPropertyValuesEqual -Left $oldValue -Right $newValue }
+    if (-not $equal) {
         return ('{0}: {1} -> {2}' -f $path, (Get-NRCompactValue $oldValue), (Get-NRCompactValue $newValue))
     }
     return
+}
+
+function Get-NRPairObjectChanges {
+    [CmdletBinding()]
+    param(
+        [AllowNull()] [object] $OldValue,
+        [AllowNull()] [object] $NewValue,
+        [string] $Prefix = ''
+    )
+
+    # Both values on the JSON path recurse directly; anything else goes
+    # through the general dispatcher, exactly as Get-NRObjectChanges
+    # would decide for this pair.
+    if (($null -eq $OldValue -or $OldValue -is [System.Management.Automation.PSCustomObject]) -and
+        ($null -eq $NewValue -or $NewValue -is [System.Management.Automation.PSCustomObject])) {
+        return (Get-NRPCustomObjectChanges -Before $OldValue -After $NewValue -Prefix $Prefix)
+    }
+    return (Get-NRObjectChanges -Before $OldValue -After $NewValue -Prefix $Prefix)
+}
+
+function Get-NRPCustomObjectPropertyMaps {
+    [CmdletBinding()]
+    param(
+        [AllowNull()] [object] $Before,
+        [AllowNull()] [object] $After
+    )
+
+    $beforeProperties = @{}
+    $afterProperties = @{}
+    $nameSet = @{}
+    if ($null -ne $Before) {
+        foreach ($property in $Before.PSObject.Properties) {
+            $beforeProperties[$property.Name] = $property
+            $nameSet[$property.Name] = $true
+        }
+    }
+    if ($null -ne $After) {
+        foreach ($property in $After.PSObject.Properties) {
+            $afterProperties[$property.Name] = $property
+            $nameSet[$property.Name] = $true
+        }
+    }
+    $names = [string[]]@($nameSet.Keys)
+    [Array]::Sort($names, [System.StringComparer]::CurrentCultureIgnoreCase)
+    return [pscustomobject]@{
+        BeforeProperties = $beforeProperties
+        AfterProperties = $afterProperties
+        Names = $names
+    }
 }
 
 function Get-NRPCustomObjectChanges {
@@ -392,11 +524,21 @@ function Get-NRPCustomObjectChanges {
     )
 
     $changes = New-Object 'System.Collections.Generic.List[string]'
-    $names = Get-NRPCustomObjectPropertyNames -Before $Before -After $After
-    foreach ($name in $names) {
-        $beforeProperty = if ($null -ne $Before) { $Before.PSObject.Properties[$name] } else { $null }
-        $afterProperty = if ($null -ne $After) { $After.PSObject.Properties[$name] } else { $null }
-        foreach ($change in @(Get-NRPCustomObjectPropertyChange -BeforeProperty $beforeProperty -AfterProperty $afterProperty -Name $name -Prefix $Prefix)) {
+
+    # Enumerate each object's properties once into name -> property maps.
+    # The sorted name list matches Get-NRPCustomObjectPropertyNames, and
+    # the per-property lookups below hit the maps instead of paying a
+    # PSObject.Properties indexer search for every property.
+    $propertyMaps = Get-NRPCustomObjectPropertyMaps -Before $Before -After $After
+    $beforeProperties = $propertyMaps.BeforeProperties
+    $afterProperties = $propertyMaps.AfterProperties
+
+    foreach ($name in $propertyMaps.Names) {
+        $beforeProperty = if ($beforeProperties.ContainsKey($name)) { $beforeProperties[$name] } else { $null }
+        $afterProperty = if ($afterProperties.ContainsKey($name)) { $afterProperties[$name] } else { $null }
+        $oldValue = if ($null -ne $beforeProperty) { $beforeProperty.Value } else { $null }
+        $newValue = if ($null -ne $afterProperty) { $afterProperty.Value } else { $null }
+        foreach ($change in @(Get-NRPCustomObjectPropertyChange -OldValue $oldValue -NewValue $newValue -Name $name -Prefix $Prefix)) {
             $changes.Add($change)
         }
     }
@@ -741,6 +883,35 @@ function Assert-NRAllowedObjectFields {
     }
 }
 
+function Assert-NRPCustomObjectShape {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [object] $Object,
+        [Parameter(Mandatory = $true)] [string[]] $RequiredFields,
+        [Parameter(Mandatory = $true)] [string[]] $AllowedFields,
+        [Parameter(Mandatory = $true)] [string] $Context
+    )
+
+    # Presence set from one enumeration, so the required check does not
+    # pay a PSObject.Properties indexer search per field, and the allowed
+    # check uses a set lookup instead of a linear scan of the allowed
+    # list per property. Error order is unchanged: required fields in
+    # declaration order first, then unsupported properties in the
+    # object's own property order.
+    $presentFields = @{}
+    foreach ($property in $Object.PSObject.Properties) { $presentFields[$property.Name] = $true }
+    foreach ($field in $RequiredFields) {
+        if (-not $presentFields.ContainsKey($field)) { throw "$Context.$field is required." }
+    }
+    $allowedFieldSet = @{}
+    foreach ($field in $AllowedFields) { $allowedFieldSet[$field] = $true }
+    foreach ($property in $Object.PSObject.Properties) {
+        if (-not $allowedFieldSet.ContainsKey($property.Name)) {
+            throw "$Context contains unsupported property '$($property.Name)'."
+        }
+    }
+}
+
 function Assert-NRObjectShape {
     [CmdletBinding()]
     param(
@@ -752,14 +923,7 @@ function Assert-NRObjectShape {
     if ($null -eq $Object) { throw "$Context is required and must be an object." }
 
     if ($Object -is [System.Management.Automation.PSCustomObject]) {
-        foreach ($field in $RequiredFields) {
-            if ($null -eq $Object.PSObject.Properties[$field]) { throw "$Context.$field is required." }
-        }
-        foreach ($property in $Object.PSObject.Properties) {
-            if ($AllowedFields -notcontains $property.Name) {
-                throw "$Context contains unsupported property '$($property.Name)'."
-            }
-        }
+        Assert-NRPCustomObjectShape -Object $Object -RequiredFields $RequiredFields -AllowedFields $AllowedFields -Context $Context
         return
     }
 
@@ -823,6 +987,24 @@ function Get-NRFieldValueForValidation {
     return ,(Get-NRProperty $Object $Field)
 }
 
+function Test-NRFieldKindValue {
+    [CmdletBinding()]
+    param([object] $Value, [string] $Kind)
+
+    # The Test-NRFieldValue kind test with the scalar and stringOrArray
+    # sub-checks inlined, so a field type assertion costs one call here
+    # instead of a chain of single-purpose helpers.
+    switch ($Kind) {
+        'string' { return ($Value -is [string]) }
+        'boolean' { return ($Value -is [bool]) }
+        'number' { return (Test-NRNumberValue $Value) }
+        'scalar' { return ($Value -is [string] -or $Value -is [bool] -or $Value -is [System.Enum] -or (Test-NRNumberValue $Value)) }
+        'stringArray' { return (Test-NRStringArrayValue $Value) }
+        'stringOrArray' { return ($Value -is [string] -or (Test-NRStringArrayValue $Value)) }
+    }
+    return $false
+}
+
 function Assert-NRFieldType {
     [CmdletBinding()]
     param(
@@ -831,6 +1013,17 @@ function Assert-NRFieldType {
         [Parameter(Mandatory = $true)] [ValidateSet('string', 'boolean', 'number', 'stringArray', 'stringOrArray', 'scalar')] [string] $Kind,
         [Parameter(Mandatory = $true)] [string] $Context
     )
+
+    if ($Object -is [System.Management.Automation.PSCustomObject]) {
+        # Inline the value fetch and the kind test for the JSON path; the
+        # general object shapes below keep the original helper chain.
+        $property = $Object.PSObject.Properties[$Field]
+        if ($null -eq $property) { return }
+        $value = $property.Value
+        if ($null -eq $value) { return }
+        if (-not (Test-NRFieldKindValue -Value $value -Kind $Kind)) { throw "$Context.$Field must be $Kind or null." }
+        return
+    }
 
     $value = Get-NRFieldValueForValidation -Object $Object -Field $Field
     if ($null -eq $value) { return }
@@ -1629,12 +1822,12 @@ $script:NRComparisonExcludedProperties = @(
 
 $script:NRComparisonFilterDefinitions = @(
     [pscustomobject]@{ Key = 'Address';       JsonName = 'address';       Command = 'Get-NetFirewallAddressFilter' },
-    [pscustomobject]@{ Key = 'Application';   JsonName = 'application';   Command = 'Get-NetFirewallApplicationFilter' },
-    [pscustomobject]@{ Key = 'Port';          JsonName = 'port';          Command = 'Get-NetFirewallPortFilter' },
-    [pscustomobject]@{ Key = 'Service';       JsonName = 'service';       Command = 'Get-NetFirewallServiceFilter' },
+    [pscustomobject]@{ Key = 'Application';   JsonName = 'application';   Command = 'Get-NetFirewallApplicationFilter'; FieldAliases = @{ AppPath = 'Program' } },
+    [pscustomobject]@{ Key = 'Port';          JsonName = 'port';          Command = 'Get-NetFirewallPortFilter'; FieldAliases = @{ DynamicTransport = 'DynamicTarget' } },
+    [pscustomobject]@{ Key = 'Service';       JsonName = 'service';       Command = 'Get-NetFirewallServiceFilter'; FieldAliases = @{ ServiceName = 'Service' } },
     [pscustomobject]@{ Key = 'Interface';     JsonName = 'interface';     Command = 'Get-NetFirewallInterfaceFilter' },
     [pscustomobject]@{ Key = 'InterfaceType'; JsonName = 'interfaceType'; Command = 'Get-NetFirewallInterfaceTypeFilter' },
-    [pscustomobject]@{ Key = 'Security';      JsonName = 'security';      Command = 'Get-NetFirewallSecurityFilter' }
+    [pscustomobject]@{ Key = 'Security';      JsonName = 'security';      Command = 'Get-NetFirewallSecurityFilter'; FieldAliases = @{ LocalUsers = 'LocalUser'; RemoteUsers = 'RemoteUser'; RemoteMachines = 'RemoteMachine' } }
 )
 
 function ConvertTo-NRComparisonCimValue {
@@ -1771,6 +1964,16 @@ function Get-NRComparisonFilterIndex {
     }
 }
 
+function Get-NRAssociatedComparisonFilter {
+    [CmdletBinding()]
+    param([string] $Command, [object] $Rule)
+    # The filter cmdlets type -AssociatedNetFirewallRule as a CimInstance, so
+    # this call is isolated in its own function: unit tests substitute this
+    # seam instead of the cmdlet, whose mocked parameter binding would reject
+    # the plain-object rules the tests use as fixtures.
+    return @(& $Command -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
+}
+
 function Get-NRRuleComparisonFilter {
     [CmdletBinding()]
     param([object] $Rule, [object] $Definition, [hashtable] $Index)
@@ -1780,7 +1983,7 @@ function Get-NRRuleComparisonFilter {
         if ($bucket.Count -eq 1) { return [pscustomobject]@{ Filter = $bucket[0]; Issue = $null } }
     }
     try {
-        $fallback = @(& $Definition.Command -AssociatedNetFirewallRule $Rule -ErrorAction Stop)
+        $fallback = @(Get-NRAssociatedComparisonFilter -Command $Definition.Command -Rule $Rule)
         if ($fallback.Count -eq 1) { return [pscustomobject]@{ Filter = $fallback[0]; Issue = $null } }
         $detail = if ($fallback.Count -eq 0) { 'No filter object returned by associated-rule query.' } else { 'Associated-rule query returned multiple filter objects.' }
         return [pscustomobject]@{ Filter = $null; Issue = [pscustomobject]@{ Filter = $Definition.Key; Detail = $detail } }
@@ -1852,6 +2055,27 @@ function Get-NRFirewallRuleComparisonIndexes {
     return $filterIndexes
 }
 
+function Add-NRComparisonFieldAliases {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [object] $Definition
+    )
+    # A filter's CIM property name can differ from the name the rest of the
+    # system uses (records, desired state, cmdlet parameters). Expose the
+    # projected value under the shared name as well so comparison entries
+    # speak the same vocabulary as records.
+    $aliases = Get-NRProperty $Definition 'FieldAliases'
+    if ($null -eq $aliases) { return }
+    foreach ($aliasName in $aliases.Keys) {
+        $sourceKey = "$($Definition.Key).$aliasName"
+        $targetKey = "$($Definition.Key).$($aliases[$aliasName])"
+        if (-not $Fields.Contains($targetKey) -and $Fields.Contains($sourceKey)) {
+            $Fields[$targetKey] = $Fields[$sourceKey]
+        }
+    }
+}
+
 function ConvertTo-NRFirewallRuleComparisonEntry {
     [CmdletBinding()]
     param(
@@ -1871,6 +2095,7 @@ function ConvertTo-NRFirewallRuleComparisonEntry {
         }
         $filterFields = Get-NRComparisonProperties -InputObject $filterResult.Filter -Section $definition.Key
         foreach ($fieldName in $filterFields.Keys) { $fields[$fieldName] = $filterFields[$fieldName] }
+        Add-NRComparisonFieldAliases -Fields $fields -Definition $definition
     }
 
     return [pscustomobject]@{
@@ -2019,17 +2244,39 @@ function Test-NRPCustomObjectComparisonFieldsEqual {
     $defaultPropertyCount = @($DefaultFields.PSObject.Properties).Count
     if ($persistentProperties.Count -ne $defaultPropertyCount) { return $false }
 
+    # Index the default fields once instead of looking every field up
+    # through PSObject.Properties inside the loop. (Measured effect on
+    # the classification stage was within noise; the remaining cost is
+    # the per-field function calls themselves.)
+    $defaultFieldsByName = @{}
+    foreach ($defaultProperty in $DefaultFields.PSObject.Properties) {
+        $defaultFieldsByName[$defaultProperty.Name] = $defaultProperty.Value
+    }
+
     foreach ($persistentProperty in $persistentProperties) {
-        $defaultProperty = $DefaultFields.PSObject.Properties[$persistentProperty.Name]
-        if ($null -eq $defaultProperty) { return $false }
-        $fastResult = Test-NRValueOnlyComparisonFieldsEqual -PersistentField $persistentProperty.Value -DefaultField $defaultProperty.Value
-        if ($null -ne $fastResult) {
-            if (-not $fastResult) { return $false }
-            continue
+        if (-not $defaultFieldsByName.ContainsKey($persistentProperty.Name)) { return $false }
+        $defaultField = $defaultFieldsByName[$persistentProperty.Name]
+        $persistentField = $persistentProperty.Value
+
+        # Value-only fast path (the same test
+        # Test-NRValueOnlyComparisonFieldsEqual performs): when both field
+        # records carry a Value property, compare the plain values
+        # directly; anything else uses the general field comparison.
+        $persistentValueProperty = $null
+        $defaultValueProperty = $null
+        if ($persistentField -is [System.Management.Automation.PSCustomObject] -and
+            $defaultField -is [System.Management.Automation.PSCustomObject]) {
+            $persistentValueProperty = $persistentField.PSObject.Properties['Value']
+            $defaultValueProperty = $defaultField.PSObject.Properties['Value']
         }
-        if (-not (Test-NRComparisonFieldValuesEqual -PersistentField $persistentProperty.Value -DefaultField $defaultProperty.Value)) {
-            return $false
+        $fieldEqual = $null
+        if ($null -ne $persistentValueProperty -and $null -ne $defaultValueProperty) {
+            $fieldEqual = Test-NRComparisonPlainValuesEqual -Left $persistentValueProperty.Value -Right $defaultValueProperty.Value
         }
+        if ($null -eq $fieldEqual) {
+            $fieldEqual = Test-NRComparisonFieldValuesEqual -PersistentField $persistentField -DefaultField $defaultField
+        }
+        if (-not $fieldEqual) { return $false }
     }
     return $true
 }
@@ -2279,6 +2526,16 @@ function Get-NRFirewallRuleRenameComparableRecord {
     return [pscustomobject]$properties
 }
 
+function Test-NRFirewallRuleRenameComparablesEqual {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [object] $BeforeComparable,
+        [Parameter(Mandatory = $true)] [object] $AfterComparable
+    )
+
+    return (@(Get-NRObjectChanges -Before $BeforeComparable -After $AfterComparable).Count -eq 0)
+}
+
 function Test-NRFirewallRuleRenameEquivalent {
     [CmdletBinding()]
     param(
@@ -2288,7 +2545,7 @@ function Test-NRFirewallRuleRenameEquivalent {
 
     $beforeComparable = Get-NRFirewallRuleRenameComparableRecord -Record $Before
     $afterComparable = Get-NRFirewallRuleRenameComparableRecord -Record $After
-    return (@(Get-NRObjectChanges -Before $beforeComparable -After $afterComparable).Count -eq 0)
+    return (Test-NRFirewallRuleRenameComparablesEqual -BeforeComparable $beforeComparable -AfterComparable $afterComparable)
 }
 
 function Add-NRFirewallRuleRenameMatch {
@@ -2321,11 +2578,26 @@ function Get-NRFirewallRuleRenameMatchInventory {
     $matchList = New-Object 'System.Collections.Generic.List[object]'
     $missingMatchCounts = @{}
     $candidateMatchCounts = @{}
+
+    # Build each Rule's comparable record once. Rebuilding them inside the
+    # pair loop would repeat the same work for every Missing x Candidate
+    # combination.
+    $missingComparables = @{}
+    foreach ($missingItem in $MissingItems) {
+        $missingName = [string]$missingItem.Name
+        $missingComparables[$missingName] = Get-NRFirewallRuleRenameComparableRecord -Record $DesiredByName[$missingName]
+    }
+    $candidateComparables = @{}
+    foreach ($candidateItem in $CandidateItems) {
+        $candidateName = [string]$candidateItem.Name
+        $candidateComparables[$candidateName] = Get-NRFirewallRuleRenameComparableRecord -Record $CurrentByName[$candidateName]
+    }
+
     foreach ($missingItem in $MissingItems) {
         $oldName = [string]$missingItem.Name
         foreach ($candidateItem in $CandidateItems) {
             $newName = [string]$candidateItem.Name
-            if (Test-NRFirewallRuleRenameEquivalent -Before $DesiredByName[$oldName] -After $CurrentByName[$newName]) {
+            if (Test-NRFirewallRuleRenameComparablesEqual -BeforeComparable $missingComparables[$oldName] -AfterComparable $candidateComparables[$newName]) {
                 Add-NRFirewallRuleRenameMatch -MatchList $matchList -MissingMatchCounts $missingMatchCounts `
                     -CandidateMatchCounts $candidateMatchCounts -OldName $oldName -NewName $newName `
                     -SystemDefaults ([string]$candidateItem.SystemDefaults)
@@ -3179,6 +3451,469 @@ function Invoke-NRDiff {
     }
 }
 
+function ConvertTo-NRSearchableSnapshotRule {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [object] $Entry)
+
+    $fields = [ordered]@{}
+    $rawFields = Get-NRComparisonEntryFields -Entry $Entry
+    if ($rawFields -is [System.Collections.IDictionary]) {
+        foreach ($key in $rawFields.Keys) {
+            $fields[[string]$key] = Get-NRComparisonFieldValue -Field $rawFields[$key]
+        }
+    }
+    elseif ($null -ne $rawFields) {
+        foreach ($property in $rawFields.PSObject.Properties) {
+            $fields[[string]$property.Name] = Get-NRComparisonFieldValue -Field $property.Value
+        }
+    }
+    # Snapshots captured before field aliasing was applied at entry
+    # construction project the raw CIM property names (AppPath,
+    # DynamicTransport). Expose those values under the record names as well,
+    # using the same alias table as the entry builder.
+    foreach ($definition in $script:NRComparisonFilterDefinitions) {
+        Add-NRComparisonFieldAliases -Fields $fields -Definition $definition
+    }
+    return [pscustomobject]@{ Name = [string](Get-NRProperty $Entry 'Name'); Fields = $fields }
+}
+
+function ConvertTo-NRSearchableDesiredRule {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [object] $Record)
+
+    # Build the same "Section.Field" map the Snapshot comparison entries use,
+    # from the field definitions the desired-state records are validated
+    # against, so one matcher can search both sources.
+    $fields = [ordered]@{}
+    $ruleBody = Get-NRProperty $Record 'rule'
+    foreach ($fieldName in $script:NRFirewallRuleFields) {
+        $fields[('Rule.{0}' -f $fieldName)] = Get-NRProperty $ruleBody $fieldName
+    }
+    $filters = Get-NRProperty $Record 'filters'
+    foreach ($definition in $script:NRComparisonFilterDefinitions) {
+        $filter = Get-NRProperty $filters $definition.JsonName
+        if ($null -eq $filter) { continue }
+        foreach ($fieldName in $script:NRFirewallFilterFields[$definition.JsonName]) {
+            $fields[('{0}.{1}' -f $definition.Key, $fieldName)] = Get-NRProperty $filter $fieldName
+        }
+    }
+    return [pscustomobject]@{ Name = [string](Get-NRProperty $Record 'name'); Fields = $fields }
+}
+
+function Add-NRSearchableRule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [System.Collections.Generic.List[object]] $Rules,
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [hashtable] $Seen,
+        [Parameter(Mandatory = $true)] [object] $Rule
+    )
+
+    if ($Seen.ContainsKey($Rule.Name)) { return }
+    $Seen[$Rule.Name] = $true
+    $Rules.Add($Rule)
+}
+
+function Get-NRSearchableFirewallRule {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [ValidateSet('Snapshot', 'Desired')] [string] $Source,
+        [AllowNull()] [object] $Snapshot,
+        [AllowNull()] [object] $Desired
+    )
+
+    $rules = New-Object 'System.Collections.Generic.List[object]'
+    $seen = @{}
+    if ($Source -eq 'Snapshot') {
+        $comparison = Get-NRProperty $Snapshot 'comparison'
+        $persistent = Get-NRProperty $comparison 'persistentStore'
+        $entries = Get-NRProperty $persistent 'Entries'
+        foreach ($entry in @(ConvertTo-NRObjectArray -Value $entries)) {
+            if ($null -eq $entry) { continue }
+            Add-NRSearchableRule -Rules $rules -Seen $seen -Rule (ConvertTo-NRSearchableSnapshotRule -Entry $entry)
+        }
+    }
+    else {
+        $records = Get-NRProperty $Desired 'firewallRules'
+        foreach ($record in @(ConvertTo-NRObjectArray -Value $records)) {
+            if ($null -eq $record) { continue }
+            Add-NRSearchableRule -Rules $rules -Seen $seen -Rule (ConvertTo-NRSearchableDesiredRule -Record $record)
+        }
+    }
+    return $rules.ToArray()
+}
+
+function ConvertTo-NRSearchText {
+    [CmdletBinding()]
+    param([AllowNull()] [object] $Value)
+
+    if ($null -eq $Value) { return '' }
+    if ($Value -is [string]) { return $Value }
+    if ($Value -is [bool] -or $Value -is [ValueType]) { return [string]$Value }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        $parts = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($item in $Value) { $parts.Add((ConvertTo-NRSearchText -Value $item)) }
+        return [string]::Join(' ', $parts.ToArray())
+    }
+    return (ConvertTo-Json -InputObject $Value -Depth 10 -Compress)
+}
+
+function Test-NRSearchValueContains {
+    [CmdletBinding()]
+    param(
+        [AllowNull()] [object] $Value,
+        [Parameter(Mandatory = $true)] [string] $Pattern
+    )
+
+    if ($null -eq $Value) { return $false }
+    if ($Value -isnot [string] -and $Value -is [System.Collections.IEnumerable]) {
+        foreach ($item in $Value) {
+            if (Test-NRSearchValueContains -Value $item -Pattern $Pattern) { return $true }
+        }
+        # Also test the joined representation, so a pattern spanning the
+        # separator of a composite value (for example "Domain, Private")
+        # can still match.
+        $joined = ConvertTo-NRSearchText -Value $Value
+        return ($joined.IndexOf($Pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+    }
+    $text = ConvertTo-NRSearchText -Value $Value
+    return ($text.IndexOf($Pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function Test-NRSearchFieldContains {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [string] $Name,
+        [Parameter(Mandatory = $true)] [string] $Pattern
+    )
+
+    if (-not $Fields.Contains($Name)) { return $false }
+    return (Test-NRSearchValueContains -Value $Fields[$Name] -Pattern $Pattern)
+}
+
+function Test-NRSearchFieldHasExactValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [string] $Name,
+        [Parameter(Mandatory = $true)] [string[]] $Values
+    )
+
+    if (-not $Fields.Contains($Name)) { return $false }
+    $raw = $Fields[$Name]
+    $elements = if ($null -eq $raw) { @() }
+        elseif ($raw -isnot [string] -and $raw -is [System.Collections.IEnumerable]) { @($raw) }
+        else { @($raw) }
+    foreach ($element in $elements) {
+        foreach ($candidate in $Values) {
+            if ([string]$element -ieq $candidate) { return $true }
+        }
+    }
+    return $false
+}
+
+function Test-NRSearchTextCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [object] $Rule,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    $text = [string](Get-NRProperty $Query 'Text')
+    if ([string]::IsNullOrWhiteSpace($text)) { return $true }
+    if (Test-NRSearchValueContains -Value $Rule.Name -Pattern $text) { return $true }
+    foreach ($key in @($Rule.Fields.Keys)) {
+        if (Test-NRSearchValueContains -Value $Rule.Fields[$key] -Pattern $text) { return $true }
+    }
+    return $false
+}
+
+function Test-NRSearchExactCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [string] $FieldName,
+        [AllowNull()] [object] $Values
+    )
+
+    if ($null -eq $Values -or @($Values).Count -eq 0) { return $true }
+    $actual = if ($Fields.Contains($FieldName)) { [string]$Fields[$FieldName] } else { '' }
+    return (@($Values | ForEach-Object { [string]$_ }) -icontains $actual)
+}
+
+function Test-NRSearchEnabledCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    $enabled = Get-NRProperty $Query 'Enabled'
+    if ($null -eq $enabled) { return $true }
+    $rawEnabled = if ($Fields.Contains('Rule.Enabled')) { $Fields['Rule.Enabled'] } else { $null }
+    if ($rawEnabled -is [bool]) { return ($rawEnabled -eq [bool]$enabled) }
+    if ($null -eq $rawEnabled) { return $false }
+    return (([string]$rawEnabled -ieq 'True') -eq [bool]$enabled)
+}
+
+function Test-NRSearchNameCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [object] $Rule,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    $namePattern = [string](Get-NRProperty $Query 'NamePattern')
+    if ([string]::IsNullOrWhiteSpace($namePattern)) { return $true }
+    if (Test-NRSearchValueContains -Value $Rule.Name -Pattern $namePattern) { return $true }
+    return (Test-NRSearchFieldContains -Fields $Rule.Fields -Name 'Rule.DisplayName' -Pattern $namePattern)
+}
+
+function Test-NRSearchSubstringCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [string] $FieldName,
+        [AllowNull()] [object] $Pattern
+    )
+
+    if ($null -eq $Pattern) { return $true }
+    $patterns = @($Pattern | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($patterns.Count -eq 0) { return $true }
+    foreach ($singlePattern in $patterns) {
+        if (Test-NRSearchFieldContains -Fields $Fields -Name $FieldName -Pattern $singlePattern) { return $true }
+    }
+    return $false
+}
+
+function Test-NRSearchPortsCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    foreach ($exact in @(
+        [pscustomobject]@{ Field = 'Port.LocalPort'; Values = (Get-NRProperty $Query 'LocalPort') },
+        [pscustomobject]@{ Field = 'Port.RemotePort'; Values = (Get-NRProperty $Query 'RemotePort') }
+    )) {
+        if ($null -eq $exact.Values -or @($exact.Values).Count -eq 0) { continue }
+        $values = @($exact.Values | ForEach-Object { [string]$_ })
+        if (-not (Test-NRSearchFieldHasExactValue -Fields $Fields -Name $exact.Field -Values $values)) { return $false }
+    }
+    return $true
+}
+
+function Test-NRSearchSidCondition {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    $sid = [string](Get-NRProperty $Query 'Sid')
+    if ([string]::IsNullOrWhiteSpace($sid)) { return $true }
+    foreach ($sidField in @('Security.LocalUser', 'Security.RemoteUser', 'Security.RemoteMachine')) {
+        if (Test-NRSearchFieldContains -Fields $Fields -Name $sidField -Pattern $sid) { return $true }
+    }
+    return $false
+}
+
+function Test-NRFirewallRuleSearchMatch {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [object] $Rule,
+        [Parameter(Mandatory = $true)] [object] $Query
+    )
+
+    $fields = $Rule.Fields
+
+    if (-not (Test-NRSearchTextCondition -Rule $Rule -Query $Query)) { return $false }
+    if (-not (Test-NRSearchExactCondition -Fields $fields -FieldName 'Rule.Direction' -Values (Get-NRProperty $Query 'Direction'))) { return $false }
+    if (-not (Test-NRSearchExactCondition -Fields $fields -FieldName 'Rule.Action' -Values (Get-NRProperty $Query 'Action'))) { return $false }
+    if (-not (Test-NRSearchEnabledCondition -Fields $fields -Query $Query)) { return $false }
+    if (-not (Test-NRSearchNameCondition -Rule $Rule -Query $Query)) { return $false }
+
+    foreach ($substring in @(
+        [pscustomobject]@{ Field = 'Rule.Profile'; Pattern = (Get-NRProperty $Query 'Profile') },
+        [pscustomobject]@{ Field = 'Application.Program'; Pattern = (Get-NRProperty $Query 'Program') },
+        [pscustomobject]@{ Field = 'Service.Service'; Pattern = (Get-NRProperty $Query 'Service') },
+        [pscustomobject]@{ Field = 'Port.Protocol'; Pattern = (Get-NRProperty $Query 'Protocol') },
+        [pscustomobject]@{ Field = 'Address.LocalAddress'; Pattern = (Get-NRProperty $Query 'LocalAddress') },
+        [pscustomobject]@{ Field = 'Address.RemoteAddress'; Pattern = (Get-NRProperty $Query 'RemoteAddress') }
+    )) {
+        if (-not (Test-NRSearchSubstringCondition -Fields $fields -FieldName $substring.Field -Pattern $substring.Pattern)) { return $false }
+    }
+
+    if (-not (Test-NRSearchPortsCondition -Fields $fields -Query $Query)) { return $false }
+    if (-not (Test-NRSearchSidCondition -Fields $fields -Query $Query)) { return $false }
+
+    return $true
+}
+
+function Test-NRProgramPathState {
+    [CmdletBinding()]
+    param([AllowNull()] [string] $Program)
+
+    if ([string]::IsNullOrWhiteSpace($Program)) { return 'NotApplicable' }
+    if ($Program -ieq 'Any') { return 'NotApplicable' }
+    # Environment variables are not expanded, so a path containing % cannot
+    # be verified; neither can a path that is not rooted.
+    if ($Program.Contains('%')) { return 'Unverifiable' }
+    $isRooted = ($Program -match '^[A-Za-z]:[\\/]') -or $Program.StartsWith('\') -or $Program.StartsWith('/')
+    if (-not $isRooted) { return 'Unverifiable' }
+    try {
+        if (Test-Path -LiteralPath $Program -PathType Leaf -ErrorAction Stop) { return 'Exists' }
+        return 'Missing'
+    }
+    catch { return 'Unverifiable' }
+}
+
+function Get-NRSearchResultSummaryText {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [System.Collections.IDictionary] $Fields)
+
+    $summary = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($pair in @(
+        [pscustomobject]@{ Label = 'Direction'; Field = 'Rule.Direction' },
+        [pscustomobject]@{ Label = 'Action'; Field = 'Rule.Action' },
+        [pscustomobject]@{ Label = 'Enabled'; Field = 'Rule.Enabled' },
+        [pscustomobject]@{ Label = 'Profile'; Field = 'Rule.Profile' }
+    )) {
+        if (-not $Fields.Contains($pair.Field)) { continue }
+        $valueText = ConvertTo-NRSearchText -Value $Fields[$pair.Field]
+        if (-not [string]::IsNullOrWhiteSpace($valueText)) { $summary.Add(('{0}: {1}' -f $pair.Label, $valueText)) }
+    }
+    return [string]::Join('; ', $summary.ToArray())
+}
+
+function Format-NRSearchResultItem {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)] [object] $Result)
+
+    $rule = $Result.Rule
+    $fields = $rule.Fields
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $displayName = if ($fields.Contains('Rule.DisplayName')) { [string]$fields['Rule.DisplayName'] } else { '' }
+    $label = if (-not [string]::IsNullOrWhiteSpace($displayName) -and $displayName -cne $rule.Name) { ' - {0}' -f $displayName } else { '' }
+    $lines.Add(('  {0}{1}' -f $rule.Name, $label))
+    $summaryText = Get-NRSearchResultSummaryText -Fields $fields
+    if (-not [string]::IsNullOrWhiteSpace($summaryText)) { $lines.Add(('      ' + $summaryText)) }
+    if ($fields.Contains('Application.Program')) {
+        $program = [string]$fields['Application.Program']
+        if (-not [string]::IsNullOrWhiteSpace($program)) {
+            $suffix = if ($Result.ProgramState -eq 'Missing' -or $Result.ProgramState -eq 'Unverifiable') { ' ({0})' -f $Result.ProgramState } else { '' }
+            $lines.Add(('      Program: {0}{1}' -f $program, $suffix))
+        }
+    }
+    return $lines.ToArray()
+}
+
+function Format-NRSearchResults {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Results,
+        [Parameter(Mandatory = $true)] [string] $Source
+    )
+
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add(('Firewall Rules ({0}): {1} matched' -f $Source, $Results.Count))
+    foreach ($result in $Results) {
+        foreach ($line in @(Format-NRSearchResultItem -Result $result)) { $lines.Add($line) }
+    }
+    return $lines.ToArray()
+}
+
+function Get-NRSearchSourceData {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [ValidateSet('Snapshot', 'Desired')] [string] $Source,
+        [Parameter(Mandatory = $true)] [string] $Path
+    )
+
+    if ($Source -eq 'Snapshot') {
+        $snapshot = Read-NRSnapshot -Path (Get-NRSnapshotPath -Path $Path)
+        if ([string]$snapshot.computerName -cne [string]$env:COMPUTERNAME) {
+            throw "Snapshot belongs to computer '$($snapshot.computerName)', not '$env:COMPUTERNAME'. Run capture on this computer."
+        }
+        return [pscustomobject]@{ Snapshot = $snapshot; Desired = $null }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Desired-state file not found: $Path." }
+    $desired = Read-NRConfiguration -Path $Path
+    Assert-NRConfiguration -Configuration $desired | Out-Null
+    return [pscustomobject]@{ Snapshot = $null; Desired = $desired }
+}
+
+function Get-NRSearchResults {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)] [AllowEmptyCollection()] [object[]] $Rules,
+        [Parameter(Mandatory = $true)] [object] $Query,
+        [switch] $MissingProgram
+    )
+
+    $results = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($rule in $Rules) {
+        if (-not (Test-NRFirewallRuleSearchMatch -Rule $rule -Query $Query)) { continue }
+        $programState = $null
+        if ($MissingProgram) {
+            $program = if ($rule.Fields.Contains('Application.Program')) { [string]$rule.Fields['Application.Program'] } else { '' }
+            $programState = Test-NRProgramPathState -Program $program
+            if ($programState -ne 'Missing' -and $programState -ne 'Unverifiable') { continue }
+        }
+        $results.Add([pscustomobject]@{ Rule = $rule; ProgramState = $programState })
+    }
+    return $results.ToArray()
+}
+
+function Invoke-NRSearch {
+    [CmdletBinding()]
+    param(
+        [string] $Path,
+        [ValidateSet('Snapshot', 'Desired')] [string] $Source = 'Snapshot',
+        [string] $Text,
+        [string[]] $Direction,
+        [string[]] $Action,
+        [switch] $Enabled,
+        [switch] $Disabled,
+        [string[]] $Profile,
+        [string] $NamePattern,
+        [string] $Program,
+        [string] $Service,
+        [string] $Protocol,
+        [string[]] $LocalPort,
+        [string[]] $RemotePort,
+        [string] $LocalAddress,
+        [string] $RemoteAddress,
+        [string] $Sid,
+        [switch] $MissingProgram
+    )
+
+    if ($Enabled -and $Disabled) { throw '-Enabled and -Disabled cannot be combined.' }
+    $Path = Resolve-NRFilePath -Path $Path
+
+    $sourceData = Get-NRSearchSourceData -Source $Source -Path $Path
+
+    $enabledQuery = $null
+    if ($Enabled) { $enabledQuery = $true }
+    elseif ($Disabled) { $enabledQuery = $false }
+    $query = [pscustomobject]@{
+        Text = $Text; Direction = $Direction; Action = $Action; Enabled = $enabledQuery
+        Profile = $Profile; NamePattern = $NamePattern; Program = $Program; Service = $Service
+        Protocol = $Protocol; LocalPort = $LocalPort; RemotePort = $RemotePort
+        LocalAddress = $LocalAddress; RemoteAddress = $RemoteAddress; Sid = $Sid
+    }
+
+    $rules = @(Get-NRSearchableFirewallRule -Source $Source -Snapshot $sourceData.Snapshot -Desired $sourceData.Desired)
+    $results = @(Get-NRSearchResults -Rules $rules -Query $query -MissingProgram:$MissingProgram)
+
+    $lines = @(Format-NRSearchResults -Results $results -Source $Source)
+    foreach ($line in $lines) {
+        if ($line -isnot [string]) { throw ('search renderer returned unexpected output type: {0}' -f $line.GetType().FullName) }
+        Write-Output -InputObject $line
+    }
+}
+
 function Assert-NRAdoptArguments {
     [CmdletBinding()]
     param([bool] $New, [bool] $Update, [bool] $Rename, [string[]] $Name)
@@ -3821,57 +4556,23 @@ function ConvertTo-NRPowerShellParameterText {
     return [string]::Join('', $parts.ToArray())
 }
 
-function Add-NRGeneratedScriptPreflight {
+function Add-NRGeneratedScriptHeader {
     [CmdletBinding()]
     param(
         [System.Collections.Generic.List[string]] $Lines,
         [string] $Path,
-        [string] $SnapshotPath,
-        [string] $StatePath
+        [string] $ComputerName
     )
-    $modulePath = $script:NRModulePath
-    $moduleHash = (Get-FileHash -LiteralPath $modulePath -Algorithm SHA256 -ErrorAction Stop).Hash
-    $configHash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
-    $snapshotHash = (Get-FileHash -LiteralPath $SnapshotPath -Algorithm SHA256 -ErrorAction Stop).Hash
-    $stateHash = (Get-FileHash -LiteralPath $StatePath -Algorithm SHA256 -ErrorAction Stop).Hash
-
+    $generatedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'
     foreach ($line in @(
         '#requires -Version 5.1',
         '#requires -RunAsAdministrator',
-        '[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = ''High'')]','param()','',
+        ('# Generated by PSNetRules generate from ''{0}'' for computer ''{1}'' at {2}.' -f $Path, $ComputerName, $generatedAt),
+        '# Review these commands before running them. Run with -WhatIf to preview the changes without applying them.',
+        '[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = ''High'')]',
+        'param()',
+        '',
         '$ErrorActionPreference = ''Stop''',
-        (' $modulePath = {0}' -f (ConvertTo-NRPowerShellLiteral $modulePath)),
-        (' $expectedModuleHash = {0}' -f (ConvertTo-NRPowerShellLiteral $moduleHash)),
-        'if ((Get-FileHash -LiteralPath $modulePath -Algorithm SHA256 -ErrorAction Stop).Hash -cne $expectedModuleHash) { throw ''PSNetRules module changed after generation.'' }',
-        'Import-Module -Name $modulePath -Force -ErrorAction Stop',
-        (' $configPath = {0}' -f (ConvertTo-NRPowerShellLiteral $Path)),
-        (' $snapshotPath = {0}' -f (ConvertTo-NRPowerShellLiteral $SnapshotPath)),
-        (' $statePath = {0}' -f (ConvertTo-NRPowerShellLiteral $StatePath)),
-        (' $expectedConfigHash = {0}' -f (ConvertTo-NRPowerShellLiteral $configHash)),
-        (' $expectedSnapshotHash = {0}' -f (ConvertTo-NRPowerShellLiteral $snapshotHash)),
-        (' $expectedStateHash = {0}' -f (ConvertTo-NRPowerShellLiteral $stateHash)),
-        'if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -cne $expectedConfigHash) { throw ''Desired configuration changed after generation.'' }',
-        'if ((Get-FileHash -LiteralPath $snapshotPath -Algorithm SHA256).Hash -cne $expectedSnapshotHash) { throw ''Capture snapshot changed after generation.'' }',
-        'if ((Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash -cne $expectedStateHash) { throw ''State file changed after generation.'' }',
-        '$snapshot = Read-NRSnapshot -Path $snapshotPath',
-        'if ($snapshot.computerName -cne $env:COMPUTERNAME) { throw ''Generated plan targets another computer.'' }',
-        '$live = Get-NRCurrentState -StatePath $statePath',
-        '$snapshotDrift = @(Get-NRDiff -Desired $snapshot.configuration -Current $live)',
-        'if ($snapshotDrift.Count -gt 0) { throw (''Current system state differs from the capture snapshot ({0} differences). Run capture, diff, and generate again.'' -f $snapshotDrift.Count) }',
-        '$livePersistentComparison = Get-NRFirewallRuleComparisonInventory -PolicyStore PersistentStore',
-        '$liveDefaultsComparison = Get-NRFirewallRuleComparisonInventory -PolicyStore SystemDefaults',
-        'if ((ConvertTo-NRCanonicalJson $livePersistentComparison) -cne (ConvertTo-NRCanonicalJson $snapshot.comparison.persistentStore)) { throw ''PersistentStore comparison properties changed after capture. Run capture, diff, and generate again.'' }',
-        'if ((ConvertTo-NRCanonicalJson $liveDefaultsComparison) -cne (ConvertTo-NRCanonicalJson $snapshot.comparison.systemDefaults)) { throw ''SystemDefaults comparison properties changed after capture. Run capture and generate again.'' }',
-        'if (-not $WhatIfPreference) { $answer = Read-Host ''Type EXECUTE GENERATED PLAN to apply these commands''; if ($answer -cne ''EXECUTE GENERATED PLAN'') { throw ''Execution cancelled.'' } }',
-        'if (-not $WhatIfPreference) {',
-        '    $backupDirectory = Join-Path (Split-Path -Parent $configPath) ''backups''',
-        '    if (-not (Test-Path -LiteralPath $backupDirectory -PathType Container)) { New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null }',
-        '    $stamp = Get-Date -Format ''yyyyMMdd-HHmmss-fff''',
-        '    $backupBaseName = [System.IO.Path]::GetFileNameWithoutExtension($configPath)',
-        '    Copy-Item -LiteralPath $configPath -Destination (Join-Path $backupDirectory ($backupBaseName + ''.pre-generate-execution.'' + $stamp + ''.json'')) -ErrorAction Stop',
-        '    Copy-Item -LiteralPath $snapshotPath -Destination (Join-Path $backupDirectory ($backupBaseName + ''.pre-generate-execution.'' + $stamp + ''.snapshot.json'')) -ErrorAction Stop',
-        '    if (Test-Path -LiteralPath $statePath -PathType Leaf) { Copy-Item -LiteralPath $statePath -Destination (Join-Path $backupDirectory ($backupBaseName + ''.pre-generate-execution.'' + $stamp + ''.state.json'')) -ErrorAction Stop }',
-        '}',
         '',
         '# Firewall Rules: only rules explicitly present in the managed configuration are reconciled.'
     )) { $Lines.Add($line) }
@@ -4076,9 +4777,9 @@ function Add-NRGeneratedNrptRemovalCommands {
     param([System.Collections.Generic.List[string]] $Lines, [hashtable] $CurrentNrpt, [hashtable] $DesiredNrpt)
     foreach ($id in @($CurrentNrpt.Keys | Where-Object { -not $DesiredNrpt.ContainsKey($_) } | Sort-Object)) {
         $idText = ConvertTo-NRPowerShellLiteral $id
-        $Lines.Add((' $windowsName = if ($state.nrptRules.ContainsKey({0})) {{ [string]$state.nrptRules[{0}] }} else {{ {0} }}' -f $idText))
+        $Lines.Add((' $windowsName = if ($nrptState.ContainsKey({0})) {{ [string]$nrptState[{0}] }} else {{ {0} }}' -f $idText))
         $Lines.Add('Remove-DnsClientNrptRule -Name $windowsName -Force -ErrorAction Stop -WhatIf:$WhatIfPreference -Confirm:$false')
-        $Lines.Add(('if (-not $WhatIfPreference -and $state.nrptRules.ContainsKey({0})) {{ $state.nrptRules.Remove({0}); Write-NRStateFile -Path $statePath -State $state }}' -f $idText))
+        $Lines.Add(('if (-not $WhatIfPreference -and $nrptState.ContainsKey({0})) {{ $nrptState.Remove({0}); Save-NRGeneratedNrptState }}' -f $idText))
     }
 }
 
@@ -4093,9 +4794,9 @@ function Add-NRGeneratedNrptDesiredCommands {
         if (-not $needsAdd -and -not $needsUpdate) { continue }
         if ($needsUpdate) {
             $idText = ConvertTo-NRPowerShellLiteral $id
-            $Lines.Add((' $windowsName = if ($state.nrptRules.ContainsKey({0})) {{ [string]$state.nrptRules[{0}] }} else {{ {0} }}' -f $idText))
+            $Lines.Add((' $windowsName = if ($nrptState.ContainsKey({0})) {{ [string]$nrptState[{0}] }} else {{ {0} }}' -f $idText))
             $Lines.Add('Remove-DnsClientNrptRule -Name $windowsName -Force -ErrorAction Stop -WhatIf:$WhatIfPreference -Confirm:$false')
-            $Lines.Add(('if (-not $WhatIfPreference -and $state.nrptRules.ContainsKey({0})) {{ $state.nrptRules.Remove({0}); Write-NRStateFile -Path $statePath -State $state }}' -f $idText))
+            $Lines.Add(('if (-not $WhatIfPreference -and $nrptState.ContainsKey({0})) {{ $nrptState.Remove({0}); Save-NRGeneratedNrptState }}' -f $idText))
         }
         $parameters = ConvertTo-NRNrptParameters -Record $record -ForAdd
         $parameters['PassThru'] = $true
@@ -4103,21 +4804,57 @@ function Add-NRGeneratedNrptDesiredCommands {
         $parameterText = ConvertTo-NRPowerShellParameterText $parameters
         $errorText = ConvertTo-NRPowerShellLiteral ("Add-DnsClientNrptRule did not return a Windows Name for '$id'.")
         $idText = ConvertTo-NRPowerShellLiteral $id
-        $Lines.Add(('if (-not $WhatIfPreference) {{ $created = @(Add-DnsClientNrptRule{0}); if ($created.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$created[0].Name)) {{ throw {1} }}; $state.nrptRules[{2}] = [string]$created[0].Name; Write-NRStateFile -Path $statePath -State $state }} else {{ Add-DnsClientNrptRule{0} -WhatIf:$true -Confirm:$false | Out-Null }}' -f $parameterText, $errorText, $idText))
+        $Lines.Add(('if (-not $WhatIfPreference) {{ $created = @(Add-DnsClientNrptRule{0}); if ($created.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$created[0].Name)) {{ throw {1} }}; $nrptState[{2}] = [string]$created[0].Name; Save-NRGeneratedNrptState }} else {{ Add-DnsClientNrptRule{0} -WhatIf:$true -Confirm:$false | Out-Null }}' -f $parameterText, $errorText, $idText))
     }
+}
+
+function Test-NRGeneratedNrptChangesExist {
+    [CmdletBinding()]
+    param([hashtable] $CurrentNrpt, [hashtable] $DesiredNrpt)
+    foreach ($id in $CurrentNrpt.Keys) {
+        if (-not $DesiredNrpt.ContainsKey($id)) { return $true }
+    }
+    foreach ($id in $DesiredNrpt.Keys) {
+        if (-not $CurrentNrpt.ContainsKey($id)) { return $true }
+        if ((ConvertTo-NRCanonicalJson $CurrentNrpt[$id]) -cne (ConvertTo-NRCanonicalJson $DesiredNrpt[$id])) { return $true }
+    }
+    return $false
+}
+
+function Add-NRGeneratedNrptStateBlock {
+    [CmdletBinding()]
+    param([System.Collections.Generic.List[string]] $Lines, [string] $StatePath)
+    $statePathLiteral = ConvertTo-NRPowerShellLiteral $StatePath
+    foreach ($line in @(
+        '# Windows assigns NRPT rule names when rules are created. The state file records',
+        '# which generated name belongs to each rule id, so later captures recognize them.',
+        ('$statePath = {0}' -f $statePathLiteral),
+        '$nrptFileState = if (Test-Path -LiteralPath $statePath -PathType Leaf) { Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json } else { [pscustomobject]@{ schemaVersion = 1; nrptRules = [pscustomobject]@{}; managedFirewallRules = @() } }',
+        'if ($null -eq $nrptFileState.nrptRules) { $nrptFileState | Add-Member -NotePropertyName ''nrptRules'' -NotePropertyValue ([pscustomobject]@{}) }',
+        '$nrptState = @{}',
+        'foreach ($property in @($nrptFileState.nrptRules.PSObject.Properties)) { $nrptState[$property.Name] = [string]$property.Value }',
+        'function Save-NRGeneratedNrptState {',
+        '    $sortedNrptRules = [ordered]@{}',
+        '    foreach ($id in @($nrptState.Keys | Sort-Object)) { $sortedNrptRules[$id] = $nrptState[$id] }',
+        '    $nrptFileState.nrptRules = [pscustomobject]$sortedNrptRules',
+        '    $stateJson = ConvertTo-Json -InputObject $nrptFileState -Depth 100',
+        '    [System.IO.File]::WriteAllText($statePath, ($stateJson + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))',
+        '}'
+    )) { $Lines.Add($line) }
 }
 
 function Add-NRGeneratedNrptCommands {
     [CmdletBinding()]
-    param([System.Collections.Generic.List[string]] $Lines, [object] $Desired, [object] $SnapshotConfiguration)
+    param([System.Collections.Generic.List[string]] $Lines, [object] $Desired, [object] $SnapshotConfiguration, [string] $StatePath)
     $currentNrpt = Get-NRMapByKey -Items @($SnapshotConfiguration.nrptRules) -KeyProperty 'id'
     $desiredNrpt = Get-NRMapByKey -Items @($Desired.nrptRules) -KeyProperty 'id'
     $Lines.Add('')
     $Lines.Add('# Local NRPT Rules')
-    $Lines.Add('$state = Read-NRStateFile -Path $statePath')
+    if (Test-NRGeneratedNrptChangesExist -CurrentNrpt $currentNrpt -DesiredNrpt $desiredNrpt) {
+        Add-NRGeneratedNrptStateBlock -Lines $Lines -StatePath $StatePath
+    }
     Add-NRGeneratedNrptRemovalCommands -Lines $Lines -CurrentNrpt $currentNrpt -DesiredNrpt $desiredNrpt
     Add-NRGeneratedNrptDesiredCommands -Lines $Lines -CurrentNrpt $currentNrpt -DesiredNrpt $desiredNrpt
-    $Lines.Add('if (-not $WhatIfPreference) { Write-NRStateFile -Path $statePath -State $state }')
 }
 
 function Write-NRGeneratedScript {
@@ -4152,12 +4889,12 @@ function Invoke-NRGenerate {
     foreach ($name in @(Get-NRExcludedFirewallRuleNames -Configuration $desired)) { $managedNames.Remove([string]$name) }
 
     $lines = New-Object 'System.Collections.Generic.List[string]'
-    Add-NRGeneratedScriptPreflight -Lines $lines -Path $Path -SnapshotPath $snapshotPath -StatePath $statePath
+    Add-NRGeneratedScriptHeader -Lines $lines -Path $Path -ComputerName ([string]$snapshot.computerName)
     $dynamicPlan = Add-NRGeneratedDynamicKeywordCommands -Lines $lines -SnapshotConfiguration $snapshotConfiguration -Desired $desired -ManagedNames $managedNames -DesiredRules $desiredRules
     Add-NRGeneratedFirewallRuleCommands -Lines $lines -CurrentRules $currentRules -DesiredRules $desiredRules `
         -ManagedNames @($managedNames.Keys) -ForceRecreate $dynamicPlan.ForceRecreate -PreRemoved $dynamicPlan.PreRemoved
     Add-NRGeneratedFirewallProfileCommands -Lines $lines -Desired $desired -SnapshotConfiguration $snapshotConfiguration
-    Add-NRGeneratedNrptCommands -Lines $lines -Desired $desired -SnapshotConfiguration $snapshotConfiguration
+    Add-NRGeneratedNrptCommands -Lines $lines -Desired $desired -SnapshotConfiguration $snapshotConfiguration -StatePath $statePath
     $lines.Add('')
     $lines.Add('if ($WhatIfPreference) { Write-Output ''WhatIf preview completed; no changes were applied.'' } else { Write-Output ''Generated commands completed. Run capture, then diff, to verify the resulting state.'' }')
 
@@ -4198,12 +4935,13 @@ Export-ModuleMember -Function @(
     'New-NRFirewallRule', 'Set-NRFirewallRule', 'Invoke-NRFirewallRuleReconcile', 'Remove-NRStaleFirewallRules', 'New-NRDynamicKeywordParameters',
     'New-NRFirewallDynamicKeyword', 'Update-NRFirewallDynamicKeyword', 'Get-NRNrptCurrentIndex', 'Write-NRNrptState',
     'Remove-NRStaleNrptRules', 'Add-NRNrptRuleAndTrack', 'Sync-NRNrptRule',
-    'Get-NRObjectChanges', 'Get-NRDiff', 'Format-NRDiff', 'Get-NRStatePath', 'Read-NRStateFile',
-    'Write-NRStateFile', 'Write-NRJsonFile', 'Read-NRConfiguration', 'Assert-NRObjectShape', 'Assert-NRFieldType', 'Assert-NRConfiguration',
+    'Get-NRObjectChanges', 'Test-NRPropertyValuePairObjectLike', 'Get-NRPairObjectChanges', 'Get-NRPCustomObjectPropertyMaps', 'Get-NRDiff', 'Format-NRDiff', 'Get-NRStatePath', 'Read-NRStateFile',
+    'Write-NRStateFile', 'Write-NRJsonFile', 'Read-NRConfiguration', 'Assert-NRPCustomObjectShape', 'Assert-NRObjectShape', 'Test-NRFieldKindValue', 'Assert-NRFieldType', 'Assert-NRConfiguration',
     'Test-NRIsAdministrator', 'Assert-NRAdministrator', 'Get-NRStringArrayFromObject', 'Get-NRFirewallFilterSpecs', 'Get-NRFirewallFilterIndex', 'Get-NRFirewallFilterFromIndex', 'Get-NRFirewallFilter', 'Get-NRFirewallRules', 'Get-NRFirewallDynamicKeywordAddresses', 'Get-NRFirewallProfiles',
     'Get-NRNrptRules', 'Get-NRCurrentState', 'ConvertTo-NRFirewallParameters', 'ConvertTo-NRProfileParameters',
     'ConvertTo-NRNrptParameters', 'ConvertTo-NRNrptComparable', 'ConvertTo-NRNrptDesiredComparable', 'New-NRBackup',
     'Invoke-NRFirewallApply', 'Invoke-NRFirewallDynamicKeywordApply', 'Remove-NRRulesReferencingRecreatedDynamicKeywords', 'Invoke-NRFirewallProfileApply', 'Invoke-NRNrptApply',
     'Get-NRSnapshotPath', 'Read-NRSnapshot', 'Get-NRFirewallRuleComparisonInventory', 'Get-NRDefaultRuleStatus', 'New-NRCaptureSnapshot', 'Get-NRFirewallRuleClassification', 'Format-NRFirewallRuleClassification',
-    'New-NRFileBackup', 'Invoke-NRCapture', 'Invoke-NRDiff', 'Invoke-NRAdopt', 'Get-NRUnmanageSelection', 'Set-NRUnmanagedConfiguration', 'Restore-NRUnmanageFiles', 'Invoke-NRUnmanage', 'ConvertTo-NRPowerShellLiteral', 'ConvertTo-NRPowerShellParameterText', 'Invoke-NRGenerate', 'Invoke-NRValidate'
+    'New-NRFileBackup', 'Invoke-NRCapture', 'Invoke-NRDiff', 'Invoke-NRAdopt', 'Get-NRUnmanageSelection', 'Set-NRUnmanagedConfiguration', 'Restore-NRUnmanageFiles', 'Invoke-NRUnmanage', 'ConvertTo-NRPowerShellLiteral', 'ConvertTo-NRPowerShellParameterText', 'Invoke-NRGenerate', 'Invoke-NRValidate',
+    'ConvertTo-NRSearchableSnapshotRule', 'ConvertTo-NRSearchableDesiredRule', 'Add-NRSearchableRule', 'Get-NRSearchableFirewallRule', 'ConvertTo-NRSearchText', 'Test-NRSearchValueContains', 'Test-NRSearchFieldContains', 'Test-NRSearchFieldHasExactValue', 'Test-NRSearchTextCondition', 'Test-NRSearchExactCondition', 'Test-NRSearchEnabledCondition', 'Test-NRSearchNameCondition', 'Test-NRSearchSubstringCondition', 'Test-NRSearchPortsCondition', 'Test-NRSearchSidCondition', 'Test-NRFirewallRuleSearchMatch', 'Test-NRProgramPathState', 'Get-NRSearchResultSummaryText', 'Format-NRSearchResultItem', 'Format-NRSearchResults', 'Get-NRSearchSourceData', 'Get-NRSearchResults', 'Invoke-NRSearch', 'Test-NRSequenceStringOrNullOnly', 'Get-NRStringSequenceFastVerdict', 'Test-NRFirewallRuleRenameComparablesEqual'
 )

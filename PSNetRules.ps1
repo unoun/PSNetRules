@@ -7,7 +7,7 @@ PSNetRules uses a desired-state workflow. Capture records the current local conf
 Run without a command to display this help.
 
 .PARAMETER Command
-Operation to perform: capture, diff, validate, adopt, unmanage, or generate.
+Operation to perform: capture, diff, validate, adopt, unmanage, generate, or search.
 
 .PARAMETER Path
 Desired-state JSON file. Defaults to .\network-rules.json. The Snapshot and State sidecars are stored beside this file.
@@ -32,6 +32,57 @@ Output file for the generated PowerShell script. Valid only with generate. Defau
 
 .PARAMETER Status
 Filter diff output to one Firewall Rule classification status, such as NewCandidate, Modified, Rename, or Excluded. Valid only with diff.
+
+.PARAMETER Source
+Where search looks: Snapshot (the latest capture) or Desired (the desired-state file). Defaults to Snapshot. Valid only with search.
+
+.PARAMETER Text
+Case-insensitive substring matched against the string representation of every Firewall Rule field. Valid only with search.
+
+.PARAMETER Direction
+Filter search results to Inbound or Outbound Rules. Valid only with search.
+
+.PARAMETER Action
+Filter search results to Allow or Block Rules. Valid only with search.
+
+.PARAMETER Enabled
+Filter search results to enabled Rules. Cannot be combined with -Disabled. Valid only with search.
+
+.PARAMETER Disabled
+Filter search results to disabled Rules. Cannot be combined with -Enabled. Valid only with search.
+
+.PARAMETER Profile
+Case-insensitive substring matched against the Profile field. Valid only with search.
+
+.PARAMETER NamePattern
+Case-insensitive substring matched against the Rule Name and DisplayName. Valid only with search.
+
+.PARAMETER Program
+Case-insensitive substring matched against the Program field. Valid only with search.
+
+.PARAMETER Service
+Case-insensitive substring matched against the Service field. Valid only with search.
+
+.PARAMETER Protocol
+Case-insensitive substring matched against the Protocol field. Valid only with search.
+
+.PARAMETER LocalPort
+Exact match against an entry of the LocalPort list. Valid only with search.
+
+.PARAMETER RemotePort
+Exact match against an entry of the RemotePort list. Valid only with search.
+
+.PARAMETER LocalAddress
+Case-insensitive substring matched against entries of the LocalAddress list. Valid only with search.
+
+.PARAMETER RemoteAddress
+Case-insensitive substring matched against entries of the RemoteAddress list. Valid only with search.
+
+.PARAMETER Sid
+Case-insensitive substring matched against the LocalUser, RemoteUser, and RemoteMachine SDDL strings. Valid only with search.
+
+.PARAMETER MissingProgram
+Restrict search results to Rules whose Program file does not exist on this computer. Paths that cannot be verified (relative paths, paths containing %, or access errors) are reported as Unverifiable instead of Missing. Valid only with search.
 
 .EXAMPLE
 .\PSNetRules.ps1
@@ -69,14 +120,23 @@ Preview excluding a Rule from management without deleting it from Windows.
 .\PSNetRules.ps1 generate -OutputPath .\network-rules.generate.ps1
 Generate a reviewable PowerShell change script.
 
+.EXAMPLE
+.\PSNetRules.ps1 search -Direction Inbound -Action Allow
+Search the latest capture snapshot for inbound Allow Rules.
+
+.EXAMPLE
+.\PSNetRules.ps1 search -MissingProgram
+List captured Rules whose Program file no longer exists.
+
 .NOTES
 The generated script requires an elevated Windows PowerShell 5.1 session. Review it before execution. Run Unit tests before Contract tests, and Contract tests before Integration tests.
 #>
 #requires -Version 5.1
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidAssignmentToAutomaticVariable', 'Profile', Justification = 'The search -Profile parameter filters Firewall Rule profiles; as a declared parameter it shadows the automatic $PROFILE variable only inside this script, by design.')]
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('capture', 'diff', 'validate', 'adopt', 'unmanage', 'generate')]
+    [ValidateSet('capture', 'diff', 'validate', 'adopt', 'unmanage', 'generate', 'search')]
     [string] $Command,
 
     [Parameter(Position = 1)]
@@ -95,7 +155,44 @@ param(
     [string] $OutputPath,
 
     [ValidateSet('NewCandidate', 'Excluded', 'ExcludedMissing', 'DefaultExcluded', 'ComparisonInconclusive', 'InSync', 'Modified', 'Rename', 'Missing', 'DeletePending', 'DeleteComplete')]
-    [string] $Status
+    [string] $Status,
+
+    [ValidateSet('Snapshot', 'Desired')]
+    [string] $Source = 'Snapshot',
+
+    [string] $Text,
+
+    [ValidateSet('Inbound', 'Outbound')]
+    [string[]] $Direction,
+
+    [ValidateSet('Allow', 'Block')]
+    [string[]] $Action,
+
+    [switch] $Enabled,
+
+    [switch] $Disabled,
+
+    [string[]] $Profile,
+
+    [string] $NamePattern,
+
+    [string] $Program,
+
+    [string] $Service,
+
+    [string] $Protocol,
+
+    [string[]] $LocalPort,
+
+    [string[]] $RemotePort,
+
+    [string] $LocalAddress,
+
+    [string] $RemoteAddress,
+
+    [string] $Sid,
+
+    [switch] $MissingProgram
 )
 
 $ErrorActionPreference = 'Stop'
@@ -129,6 +226,12 @@ try {
     if ($Status -and $Command -ne 'diff') {
         throw '-Status is supported only by diff.'
     }
+    $searchOnlyParameters = @('Source', 'Text', 'Direction', 'Action', 'Enabled', 'Disabled', 'Profile', 'NamePattern', 'Program', 'Service', 'Protocol', 'LocalPort', 'RemotePort', 'LocalAddress', 'RemoteAddress', 'Sid', 'MissingProgram')
+    foreach ($searchParameter in $searchOnlyParameters) {
+        if ($PSBoundParameters.ContainsKey($searchParameter) -and $Command -ne 'search') {
+            throw ('-{0} is supported only by search.' -f $searchParameter)
+        }
+    }
 
     switch ($Command) {
         'capture'  { Invoke-NRCapture -Path $Path }
@@ -148,6 +251,16 @@ try {
             $operationParameters = @{ Path = $Path; OutputPath = $OutputPath; Force = $Force; WhatIf = $WhatIfPreference }
             if ($PSBoundParameters.ContainsKey('Confirm')) { $operationParameters['Confirm'] = $Confirm }
             Invoke-NRGenerate @operationParameters
+        }
+        'search' {
+            $operationParameters = @{
+                Path = $Path; Source = $Source; Text = $Text; Direction = $Direction; Action = $Action
+                Enabled = $Enabled; Disabled = $Disabled; Profile = $Profile; NamePattern = $NamePattern
+                Program = $Program; Service = $Service; Protocol = $Protocol; LocalPort = $LocalPort
+                RemotePort = $RemotePort; LocalAddress = $LocalAddress; RemoteAddress = $RemoteAddress
+                Sid = $Sid; MissingProgram = $MissingProgram
+            }
+            Invoke-NRSearch @operationParameters
         }
     }
 }

@@ -6,8 +6,10 @@ param(
     [string] $Mode = 'Measure',
     [string] $BaselinePath,
     [string] $OutputPath,
-    [ValidateRange(1, 10)] [int] $Iterations = 3,
-    [ValidateRange(0, 3)] [int] $WarmupIterations = 0
+    [ValidateRange(1, 10)] [int] $Iterations = 5,
+    [ValidateRange(0, 3)] [int] $WarmupIterations = 1,
+    [ValidateRange(0.1, 100.0)] [double] $RegressionLimitPercent = 5.0,
+    [switch] $WorkloadCounters
 )
 
 Set-StrictMode -Version 2.0
@@ -31,7 +33,58 @@ $script:NRPerformanceWorkload = [ordered]@{
     FilterTypesPerRule = 7
     ObjectShape = 'Native-shaped PSCustomObjects; Snapshot comparison fields are Value-only PSCustomObjects.'
 }
-$script:NRPerformanceRegressionLimitPercent = 5.0
+$script:NRPerformanceRegressionLimitPercent = $RegressionLimitPercent
+
+# Functions instrumented when -WorkloadCounters is supplied. The counters are
+# a diagnosis tool: call counts are deterministic even when wall-clock timings
+# are noisy, so they show where the per-item work concentrates and whether a
+# change actually reduced it. Keep this list focused on the comparison and
+# classification hot paths; the instrumentation function fails loudly if a
+# listed function disappears from the module source.
+$script:NRPerformanceCounterTargets = @(
+    'ConvertTo-NRFirewallRuleComparisonEntry'
+    'Get-NRFirewallFilterIndex'
+    'Get-NRComparisonProperties'
+    'ConvertTo-NRComparisonPlainValue'
+    'ConvertTo-NRComparisonCanonicalPlainValue'
+    'Test-NRComparisonPlainValuesEqual'
+    'Test-NRComparisonFieldValuesEqual'
+    'Test-NRCanonicalValuesEqual'
+    'Get-NRMapByKey'
+    'Get-NRProperty'
+    'Get-NRPropertyNames'
+    'Test-NRObjectLike'
+    'Get-NRFirewallRuleClassification'
+    'Format-NRFirewallRuleClassification'
+    'Get-NRObjectChanges'
+    'Get-NRPCustomObjectChanges'
+    'Get-NRPCustomObjectPropertyChange'
+    'Get-NRPCustomObjectPropertyNames'
+    'Test-NRPropertyValueObjectLike'
+    'Test-NRPropertyValuePairObjectLike'
+    'Get-NRPairObjectChanges'
+    'Test-NRCustomObjectPropertyValuesEqual'
+    'Test-NRStringSequenceEqual'
+    'Get-NRCompactValue'
+    'Get-NRFirewallRuleDisplayInfo'
+    'New-NRFirewallClassificationRecord'
+    'Get-NRDefaultRuleStatus'
+    'Assert-NRConfiguration'
+    'Assert-NRFirewallRules'
+    'Assert-NRFirewallRule'
+    'Assert-NRFirewallRuleBody'
+    'Assert-NRFirewallFilter'
+    'Assert-NRObjectShape'
+    'Assert-NRFieldType'
+    'Get-NRFieldValueForValidation'
+    'Test-NRFieldValue'
+    'Test-NRNumberValue'
+    'Test-NRScalarValue'
+    'Test-NRStringArrayValue'
+    'Test-NRStringOrArrayValue'
+    'Assert-NRArrayField'
+    'Test-NRProperty'
+)
 
 $RepositoryRoot = [System.IO.Path]::GetFullPath($RepositoryRoot)
 $modulePath = Join-Path $RepositoryRoot 'src\PSNetRules.psm1'
@@ -158,6 +211,56 @@ function Write-NRPerformanceJsonFile {
         $stream.Dispose()
     }
     return $fullPath
+}
+
+function Add-NRPerformanceWorkloadCounterInstrumentation {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Source,
+        [Parameter(Mandatory = $true)] [string[]] $FunctionNames
+    )
+
+    # Insert a counter increment as the first statement of each target
+    # function, located through the AST so the instrumentation follows the
+    # code instead of depending on line numbers. The production source on
+    # disk is never modified; only the in-memory copy is instrumented.
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($Source, [ref]$tokens, [ref]$parseErrors)
+    if ($null -ne $parseErrors -and $parseErrors.Count -gt 0) {
+        throw ('Module source did not parse for workload-counter instrumentation: {0}' -f $parseErrors[0].Message)
+    }
+
+    $remaining = @{}
+    foreach ($name in $FunctionNames) { $remaining[$name] = $true }
+    $insertions = New-Object 'System.Collections.Generic.List[object]'
+    $functionNodes = $ast.FindAll({
+        param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true)
+    foreach ($node in $functionNodes) {
+        if (-not $remaining.ContainsKey($node.Name)) { continue }
+        $offset = if ($null -ne $node.Body.ParamBlock) {
+            $node.Body.ParamBlock.Extent.EndOffset
+        }
+        else {
+            $node.Body.Extent.StartOffset + 1
+        }
+        $insertions.Add([pscustomobject]@{ Name = $node.Name; Offset = $offset })
+        $remaining.Remove($node.Name)
+    }
+    if ($remaining.Count -gt 0) {
+        throw ('Workload-counter target function(s) not found in module source: {0}' -f `
+            (@($remaining.Keys | Sort-Object) -join ', '))
+    }
+
+    # Drop a leading BOM so the prepended initialization stays the first
+    # statement and no stray BOM lands mid-file.
+    $builder = New-Object 'System.Text.StringBuilder' ($Source.TrimStart([char]0xFEFF))
+    foreach ($insertion in @($insertions | Sort-Object Offset -Descending)) {
+        $statement = "`n    `$script:NRWorkloadCounters['" + $insertion.Name + `
+            "'] = 1 + [int]`$script:NRWorkloadCounters['" + $insertion.Name + "']"
+        [void]$builder.Insert($insertion.Offset, $statement)
+    }
+    return "`$script:NRWorkloadCounters = @{}`n" + $builder.ToString()
 }
 
 function New-NRPerformanceCaptureSource {
@@ -340,13 +443,14 @@ function Measure-NRPerformanceAction {
         [hashtable] $Parameters = @{},
         [Parameter(Mandatory = $true)] [int] $Warmups,
         [Parameter(Mandatory = $true)] [int] $Count,
-        [switch] $CaptureStageMetrics
+        [switch] $CaptureStageMetrics,
+        [switch] $ResetWorkloadCounters
     )
 
     # Stage timings and the last scenario result are collected from the same
     # execution so individual metrics do not require repeated full pipelines.
     return (& $Module {
-        param($MetricName, $MetricAction, $MetricParameters, $WarmupCount, $IterationCount, $CaptureStages)
+        param($MetricName, $MetricAction, $MetricParameters, $WarmupCount, $IterationCount, $CaptureStages, $ResetCounters)
 
         function script:Get-NRPerformanceHarnessStatistics {
             param([Parameter(Mandatory = $true)] [double[]] $Values)
@@ -361,6 +465,10 @@ function Measure-NRPerformanceAction {
                 SamplesMs = @($Values | ForEach-Object { [Math]::Round($_, 3) })
             }
         }
+
+        # Reset by assigning a new hashtable: a snapshot taken by the caller
+        # after a previous scenario keeps referring to the old one.
+        if ($ResetCounters) { $script:NRWorkloadCounters = @{} }
 
         for ($warmup = 0; $warmup -lt $WarmupCount; $warmup++) {
             $null = & $MetricAction @MetricParameters
@@ -407,7 +515,7 @@ function Measure-NRPerformanceAction {
             StageMetrics = [pscustomobject]$stageMetrics
             Result = $lastData
         }
-    } $Name $Action $Parameters $Warmups $Count ([bool]$CaptureStageMetrics))
+    } $Name $Action $Parameters $Warmups $Count ([bool]$CaptureStageMetrics) ([bool]$ResetWorkloadCounters))
 }
 
 function Get-NRPerformanceProperty {
@@ -564,6 +672,10 @@ try {
     # and its Windows PowerShell 5.1 analysis cache under the user profile; no
     # module files are copied to or written under the user profile.
     $moduleSource = [System.IO.File]::ReadAllText($modulePath)
+    if ($WorkloadCounters) {
+        $moduleSource = Add-NRPerformanceWorkloadCounterInstrumentation `
+            -Source $moduleSource -FunctionNames $script:NRPerformanceCounterTargets
+    }
     $moduleScriptBlock = [scriptblock]::Create($moduleSource)
     $module = New-Module -Name 'PSNetRulesPerformanceHarness' -ScriptBlock $moduleScriptBlock
 
@@ -850,7 +962,12 @@ try {
         -Parameters @{ PersistentSource = $persistentSource; Configuration = $configurationSet.Current; `
             Desired = $configurationSet.Desired; State = $configurationSet.State; `
             ExcludedProperties = @(& $module { return ,@($script:NRComparisonExcludedProperties) }) } `
-        -Warmups $WarmupIterations -Count $Iterations -CaptureStageMetrics
+        -Warmups $WarmupIterations -Count $Iterations -CaptureStageMetrics `
+        -ResetWorkloadCounters:$WorkloadCounters
+    $captureWorkloadCounters = $null
+    if ($WorkloadCounters) {
+        $captureWorkloadCounters = & $module { return $script:NRWorkloadCounters }
+    }
     foreach ($stageMetric in $captureMeasurement.StageMetrics.PSObject.Properties) {
         $metrics[$stageMetric.Name] = $stageMetric.Value
     }
@@ -896,7 +1013,12 @@ try {
             DefaultsByName = $diffIndexes.DefaultsByName
             CurrentByName = $diffIndexes.CurrentByName
             DesiredByName = $diffIndexes.DesiredByName
-        } -Warmups $WarmupIterations -Count $Iterations -CaptureStageMetrics
+        } -Warmups $WarmupIterations -Count $Iterations -CaptureStageMetrics `
+        -ResetWorkloadCounters:$WorkloadCounters
+    $diffWorkloadCounters = $null
+    if ($WorkloadCounters) {
+        $diffWorkloadCounters = & $module { return $script:NRWorkloadCounters }
+    }
     foreach ($stageMetric in $diffMeasurement.StageMetrics.PSObject.Properties) {
         $metrics[$stageMetric.Name] = $stageMetric.Value
     }
@@ -925,6 +1047,16 @@ try {
         Metrics = [pscustomobject]$metrics
         Scope = 'CPU-only post-enumeration Capture and in-memory Diff. Metric timers exclude OS Firewall acquisition and data-file I/O; optional baseline/report file I/O occurs outside timed sections.'
     }
+    if ($WorkloadCounters) {
+        # Counts accumulate over every execution of the scenario in this run
+        # (warmups + measured iterations). Run with -WarmupIterations 0 and
+        # -Iterations 1 for exact per-pass counts.
+        $report | Add-Member -NotePropertyName WorkloadCounters -NotePropertyValue ([pscustomobject][ordered]@{
+            ExecutionsPerScenario = $WarmupIterations + $Iterations
+            Capture = [pscustomobject]$captureWorkloadCounters
+            Diff = [pscustomobject]$diffWorkloadCounters
+        })
+    }
 
     Write-Host ''
     Write-Host 'PSNetRules performance results (milliseconds; median):'
@@ -937,6 +1069,18 @@ try {
         }
     }
     $metricRows | Format-Table -AutoSize
+
+    if ($WorkloadCounters) {
+        foreach ($scenarioName in @('Capture', 'Diff')) {
+            Write-Host ''
+            Write-Host ('Workload counters ({0}; totals over {1} execution(s) of the scenario):' -f `
+                $scenarioName, ($WarmupIterations + $Iterations))
+            $counterRows = foreach ($counterProperty in $report.WorkloadCounters.$scenarioName.PSObject.Properties) {
+                [pscustomobject]@{ Function = $counterProperty.Name; Calls = [int]$counterProperty.Value }
+            }
+            $counterRows | Sort-Object Calls -Descending | Format-Table -AutoSize
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $writtenReport = Write-NRPerformanceJsonFile -Path $resolvedOutputPath -InputObject $report -BaseDirectory $RepositoryRoot
@@ -953,7 +1097,7 @@ try {
         Write-Host ('Performance regression gate (failure at {0:N0}% or more):' -f $script:NRPerformanceRegressionLimitPercent)
         $comparison.Rows | Format-Table -AutoSize
         if ($comparison.RegressionFound) {
-            throw 'Performance regression gate failed: at least one metric is 5% or more slower than its fixed baseline.'
+            throw ('Performance regression gate failed: at least one metric is {0:N0}% or more slower than its fixed baseline.' -f $script:NRPerformanceRegressionLimitPercent)
         }
         Write-Host 'Performance regression gate passed.'
     }

@@ -47,7 +47,7 @@ The example configuration and JSON Schemas are in `examples/` and `schema/`. `ne
 - Administrator privileges for `capture` and for executing a generated change script.
 - Pester 6.x for the Pester suites.
 
-`diff`, `validate`, `adopt`, `unmanage`, and `generate` do not require elevation. `diff` reads the saved Snapshot; it does not query Windows. Run `capture` after the local configuration may have changed.
+`diff`, `validate`, `adopt`, `unmanage`, `generate`, and `search` do not require elevation. `diff` reads the saved Snapshot; it does not query Windows. Run `capture` after the local configuration may have changed.
 
 ## Initial setup
 
@@ -100,6 +100,26 @@ The main Firewall Rule statuses are:
 | `Rename` | A `Missing` Rule and a `NewCandidate` have an unambiguous one-to-one match after ignoring Name. |
 | `DeletePending` / `DeleteComplete` | An adopted Name was removed from desired state; the Rule is still present / is already absent in the latest capture. |
 | `Excluded` / `ExcludedMissing` | An explicitly excluded Rule is present / absent in the latest capture. |
+
+### Search Rules
+
+`search` finds Firewall Rules in the latest capture Snapshot (default) or in the desired-state file (`-Source Desired`). Conditions combine with AND; repeated values of one parameter combine with OR. Substring matches are case-insensitive.
+
+```powershell
+# Inbound Allow Rules in the Snapshot.
+.\PSNetRules.ps1 search -Direction Inbound -Action Allow
+
+# Rules whose security filters mention a SID, in the desired state.
+.\PSNetRules.ps1 search -Source Desired -Sid S-1-5-18
+
+# Substring match across every field.
+.\PSNetRules.ps1 search -Text sql
+
+# Rules whose Program file no longer exists on this computer.
+.\PSNetRules.ps1 search -MissingProgram
+```
+
+With `-MissingProgram`, Rules whose Program is blank or `Any` are skipped. Paths that cannot be verified (relative paths, paths containing `%`, or access errors) are reported as `Unverifiable` instead of `Missing`; environment variables are not expanded. The full specification is in `docs/search-command-spec.md`.
 
 ### Adopt or update Rules
 
@@ -177,6 +197,8 @@ The generated operation is not transactional. If a Windows cmdlet fails after ea
 The test suites separate module behavior, Windows cmdlet contracts, and real system integration:
 
 - **Unit** (`tests/`): Pester tests for module behavior and the `PSNetRules.ps1` entry point. Windows cmdlets are mocked at the OS boundary. The Unit runner targets 99% module line coverage by default.
+  - `PSNetRules.Tests.ps1` is platform-independent and also runs under PowerShell 7 on non-Windows platforms: the shared setup in `tests/Common/` falls back to the signature-only stub modules under `tests/Stubs/` when the real `NetSecurity` and `DnsClient` modules do not exist. On Windows the real modules are always used, and a failure to load them is an error.
+  - `PSNetRules.Windows.Tests.ps1` holds the few tests that require real Windows objects (a `CimInstance`, the Windows security principal). It is part of the unit suite so those module lines stay inside the coverage gate; the runner includes it only on Windows, and its tests skip themselves on other platforms.
 - **Contract** (`contract-tests/`): elevated, read-only checks against installed Windows cmdlet parameters and real native objects.
 - **Integration** (`integration-tests/`): guarded create/update/delete tests for temporary Firewall Rules, local NRPT Rules, and Dynamic Keyword Addresses. Firewall Profiles are read-only in this suite. No system changes occur unless `-AllowSystemChanges` is supplied and the confirmation phrase is accepted.
 - **PSScriptAnalyzer**: static PowerShell lint checks.

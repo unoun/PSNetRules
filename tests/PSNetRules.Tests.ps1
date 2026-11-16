@@ -1,191 +1,5 @@
 ﻿BeforeAll {
-    Import-Module NetSecurity -ErrorAction Stop
-    Import-Module DnsClient -ErrorAction Stop
-
-    # Mock -ModuleName must resolve to one unambiguous module instance. Remove
-    # any previously loaded copy before importing the module under test.
-    Get-Module -Name PSNetRules | Remove-Module -Force -ErrorAction SilentlyContinue
-    $netRulesModulePath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\src\PSNetRules.psm1'))
-    $script:NetRulesModule = Import-Module -Name $netRulesModulePath -Force -PassThru -ErrorAction Stop
-
-    $fixturePath = Join-Path $PSScriptRoot 'Fixtures\PSNetRules.TestFixtures.ps1'
-    if (-not (Test-Path -LiteralPath $fixturePath -PathType Leaf)) { throw "Shared test fixture file not found: $fixturePath" }
-    . $fixturePath
-
-    $loadedNetRulesModules = @(Get-Module -Name PSNetRules)
-    if ($loadedNetRulesModules.Count -ne 1 -or $loadedNetRulesModules[0].Path -ne $script:NetRulesModule.Path) {
-        throw ('Expected exactly one PSNetRules module instance from {0}; found {1}.' -f $netRulesModulePath, $loadedNetRulesModules.Count)
-    }
-
-    function Invoke-NRPrivateFunction {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)] [string] $Name,
-            [hashtable] $Parameters = @{}
-        )
-        $module = $script:NetRulesModule
-        if ($null -eq $module) { throw 'PSNetRules module is not loaded.' }
-        & $module {
-            param($PrivateName, $PrivateParameters)
-            & $PrivateName @PrivateParameters
-        } $Name $Parameters
-    }
-
-    $script:PSNetRulesRootScriptPath = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\PSNetRules.ps1'))
-
-    function Invoke-NRRootScriptInChildProcess {
-        [CmdletBinding()]
-        param(
-            [string[]] $Arguments = @(),
-            [string] $ScriptPath = $script:PSNetRulesRootScriptPath
-        )
-
-        # Run the CLI in a child process using the same PowerShell executable.
-        # Bind parameters by name so switches such as -WhatIf are not mistaken
-        # for positional values of the CLI's Path parameter.
-        $executablePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $payloadJson = ConvertTo-Json -InputObject ([pscustomobject]@{
-            ScriptPath = $ScriptPath
-            Arguments = @($Arguments)
-        }) -Depth 4 -Compress
-        $payloadBase64 = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payloadJson))
-        $childCommandTemplate = @'
-$ProgressPreference = 'SilentlyContinue'
-$payloadJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('__PAYLOAD__'))
-$payload = ConvertFrom-Json -InputObject $payloadJson
-$arguments = @($payload.Arguments | ForEach-Object { [string]$_ })
-
-# The PowerShell parameter binder handles -? before the CLI script body runs.
-if ($arguments.Count -eq 1 -and $arguments[0] -eq '-?') {
-    & $payload.ScriptPath -?
-    return
-}
-
-$invokeParameters = @{}
-$argumentIndex = 0
-if ($arguments.Count -gt 0 -and -not $arguments[0].StartsWith('-')) {
-    $invokeParameters['Command'] = $arguments[0]
-    $argumentIndex = 1
-}
-
-$switchParameterNames = @('Force', 'New', 'Update', 'Rename', 'WhatIf', 'Confirm')
-$valueParameterNames = @('Command', 'Path', 'Name', 'OutputPath', 'Status')
-while ($argumentIndex -lt $arguments.Count) {
-    $token = $arguments[$argumentIndex]
-    if (-not $token.StartsWith('-')) {
-        throw ('Unexpected positional argument: {0}' -f $token)
-    }
-
-    $parameterName = $token.TrimStart('-')
-    if ($switchParameterNames -contains $parameterName) {
-        $invokeParameters[$parameterName] = $true
-        $argumentIndex++
-        continue
-    }
-    if ($valueParameterNames -notcontains $parameterName) {
-        throw ('Unsupported test argument: {0}' -f $token)
-    }
-
-    $argumentIndex++
-    if ($argumentIndex -ge $arguments.Count -or $arguments[$argumentIndex].StartsWith('-')) {
-        throw ('Missing value for parameter -{0}.' -f $parameterName)
-    }
-
-    if ($parameterName -eq 'Name') {
-        $nameValues = New-Object 'System.Collections.Generic.List[string]'
-        while ($argumentIndex -lt $arguments.Count -and -not $arguments[$argumentIndex].StartsWith('-')) {
-            $nameValues.Add([string]$arguments[$argumentIndex])
-            $argumentIndex++
-        }
-        $invokeParameters[$parameterName] = $nameValues.ToArray()
-    }
-    else {
-        $invokeParameters[$parameterName] = [string]$arguments[$argumentIndex]
-        $argumentIndex++
-    }
-}
-
-if ($invokeParameters.Count -eq 0) {
-    & $payload.ScriptPath
-}
-else {
-    & $payload.ScriptPath @invokeParameters
-}
-'@
-        $childCommand = $childCommandTemplate.Replace('__PAYLOAD__', $payloadBase64)
-        $encodedCommand = [System.Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($childCommand))
-
-        $process = New-Object System.Diagnostics.Process
-        try {
-            $process.StartInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $process.StartInfo.FileName = $executablePath
-            $process.StartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + $encodedCommand
-            $process.StartInfo.UseShellExecute = $false
-            $process.StartInfo.CreateNoWindow = $true
-            $process.StartInfo.RedirectStandardOutput = $true
-            $process.StartInfo.RedirectStandardError = $true
-
-            if (-not $process.Start()) {
-                throw 'Unable to start the PowerShell child process.'
-            }
-
-            # Read stdout and stderr concurrently so a full pipe cannot block
-            # the child process while the parent waits for the other stream.
-            $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
-            $standardErrorTask = $process.StandardError.ReadToEndAsync()
-            $process.WaitForExit()
-            $standardOutput = $standardOutputTask.Result
-            $standardError = $standardErrorTask.Result
-            $outputParts = @($standardOutput, $standardError) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-
-            return [pscustomobject]@{
-                ExitCode = $process.ExitCode
-                StandardOutput = $standardOutput
-                StandardError = $standardError
-                Output = $outputParts -join [Environment]::NewLine
-            }
-        }
-        finally {
-            $process.Dispose()
-        }
-    }
-
-    function Assert-NRChildProcessSuccess {
-        [CmdletBinding()]
-        param(
-            [Parameter(Mandatory = $true)] [object] $Result,
-            [Parameter(Mandatory = $true)] [string] $Context
-        )
-        if ($Result.ExitCode -ne 0) {
-            throw ("{0} failed with exit code {1}.`nStandardOutput:`n{2}`nStandardError:`n{3}" -f `
-                $Context, $Result.ExitCode, $Result.StandardOutput, $Result.StandardError)
-        }
-    }
-
-    function Copy-TestObject {
-        param([object] $InputObject)
-        return ($InputObject | ConvertTo-Json -Depth 100 | ConvertFrom-Json)
-    }
-
-    function Write-TestUtf8JsonFile {
-        param([string] $Path, [object] $InputObject)
-        $json = ConvertTo-Json -InputObject $InputObject -Depth 100
-        $encoding = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText($Path, $json, $encoding)
-    }
-
-    # Define shared helpers in the root BeforeAll scope. Pester's isolated It
-    # scopes do not reliably expose functions declared inside a Describe block.
-    function Get-NRTestUnmanageBackups {
-        [CmdletBinding()]
-        param([Parameter(Mandatory = $true)] [string] $ConfigurationPath)
-
-        $directory = Join-Path (Split-Path -Parent $ConfigurationPath) 'backups'
-        if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return @() }
-        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($ConfigurationPath)
-        $extension = [System.IO.Path]::GetExtension($ConfigurationPath)
-        return @(Get-ChildItem -LiteralPath $directory -Filter ($baseName + '*.pre-unmanage.*' + $extension) -File)
-    }
+    . (Join-Path $PSScriptRoot 'Common\PSNetRules.TestSetup.ps1')
 }
 
 Describe 'PSNetRules module structure' {
@@ -204,7 +18,12 @@ Describe 'PSNetRules module structure' {
 
         $internalCommandMatches = [regex]::Matches($moduleSource, '\b(?:Assert|Get|Set|Test|New|Remove|Write|Read|Resolve|Invoke|Add|Update|Convert|Format|Move|Restore|Start|Stop|Complete|Clear|Initialize|Import|Export|Find|Compare|Copy|Reset|Save|Select|Use|Sync|Ensure|Build)-NR[A-Za-z0-9_-]*\b')
         $internalCommands = @($internalCommandMatches | ForEach-Object { $_.Value } | Sort-Object -Unique)
-        $missingInternalCommands = @($internalCommands | Where-Object { $_ -notin $uniqueFunctions })
+        # Commands defined inside the generated apply script, not in this module:
+        # Add-NRGeneratedNrptStateBlock emits 'function Save-NRGeneratedNrptState' into
+        # the generated script, so its NRPT commands can update the state file
+        # without importing the module.
+        $generatedScriptOnlyCommands = @('Save-NRGeneratedNrptState')
+        $missingInternalCommands = @($internalCommands | Where-Object { $_ -notin $uniqueFunctions -and $_ -notin $generatedScriptOnlyCommands })
 
         $problems = @()
         if ($duplicateFunctions.Count -gt 0) { $problems += ('Duplicate function definitions: ' + ($duplicateFunctions -join ', ')) }
@@ -2188,13 +2007,6 @@ Describe 'PSNetRules managed Firewall Rule workflows' {
         foreach ($fieldName in @('Rule.Enabled', 'Rule.RemoteAddress', 'Rule.WhenCreated', 'Rule.Mode', 'Rule.Settings')) {
             $fields[$fieldName].PSObject.Properties['Canonical'] | Should-Be $null
         }
-
-        $cimRule = New-CimInstance -Namespace 'root/standardcimv2' -ClassName 'MSFT_NetFirewallRule' -ClientOnly `
-            -Property @{ Name = 'Cim-Rule'; InstanceID = 'cim-rule-id'; DisplayName = 'CIM Rule' }
-        $cimFields = Invoke-NRPrivateFunction -Name Get-NRComparisonProperties -Parameters @{ InputObject = $cimRule; Section = 'Rule' }
-        $cimFields.Count | Should-Be 1
-        $cimFields['Rule.DisplayName'].Value | Should-Be 'CIM Rule'
-        $cimFields['Rule.DisplayName'].PSObject.Properties['Canonical'] | Should-Be $null
     }
 
     It 'compares value-only PSCustomObject fields through the specialized comparison path' {
@@ -2310,8 +2122,12 @@ Describe 'PSNetRules managed Firewall Rule workflows' {
         $result = @(Invoke-NRGenerate -Path $path -OutputPath $outputPath) -join [Environment]::NewLine
         $result | Should-MatchString 'Generated:'
         $generated = Get-Content -LiteralPath $outputPath -Raw
-        $generated | Should-MatchString 'EXECUTE GENERATED PLAN'
-        $generated | Should-MatchString 'Get-NRFirewallRuleComparisonInventory'
+        $generated | Should-MatchString '#requires -RunAsAdministrator'
+        $generated | Should-MatchString 'Generated by PSNetRules generate'
+        $generated | Should-NotMatchString 'EXECUTE GENERATED PLAN'
+        $generated | Should-NotMatchString 'Import-Module'
+        $generated | Should-NotMatchString 'Get-NRFirewallRuleComparisonInventory'
+        $generated | Should-NotMatchString 'Save-NRGeneratedNrptState'
         $generated | Should-MatchString 'New-NetFirewallRule'
         $generated | Should-MatchString 'Run capture, then diff'
         (Read-NRConfiguration -Path $path).firewallRules.Count | Should-Be 1
@@ -2938,15 +2754,62 @@ Describe 'PSNetRules comparison inventory and state normalization' {
         }
     }
 
+    It 'exposes the program under the record name when the application filter uses the CIM AppPath property' {
+        $cimRule = New-NRFixtureFirewallRuleObject -Properties ([ordered]@{
+            Name = 'Rule-Cim'; InstanceID = 'rule-cim-id'; Enabled = 'True'; Direction = 'Outbound'; Action = 'Allow'
+        })
+        $bothRule = New-NRFixtureFirewallRuleObject -Properties ([ordered]@{
+            Name = 'Rule-Both'; InstanceID = 'rule-both-id'; Enabled = 'True'; Direction = 'Outbound'; Action = 'Allow'
+        })
+        $cimAddress = New-NRFixtureFirewallFilter -Type Address -InstanceId 'rule-cim-id' -Properties @{ RemoteAddress = @('Any') }
+        $bothAddress = New-NRFixtureFirewallFilter -Type Address -InstanceId 'rule-both-id' -Properties @{ RemoteAddress = @('Any') }
+        $cimApplication = [pscustomobject]@{ InstanceID = 'rule-cim-id'; AppPath = 'C:\cim\app.exe'; Package = $null }
+        $bothApplication = [pscustomobject]@{ InstanceID = 'rule-both-id'; AppPath = 'C:\cim\alias.exe'; Program = 'C:\record\app.exe'; Package = $null }
+        $cimPort = [pscustomobject]@{ InstanceID = 'rule-cim-id'; Protocol = 'UDP'; LocalPort = @('5353'); RemotePort = @('Any'); IcmpType = @(); DynamicTransport = 'Any' }
+        $bothPort = New-NRFixtureFirewallFilter -Type Port -InstanceId 'rule-both-id' -Properties @{ LocalPort = @('Any') }
+        $cimService = [pscustomobject]@{ InstanceID = 'rule-cim-id'; ServiceName = 'ExampleSvc' }
+        $bothService = New-NRFixtureFirewallFilter -Type Service -InstanceId 'rule-both-id' -Properties @{ Service = 'Any' }
+        $cimInterface = New-NRFixtureFirewallFilter -Type Interface -InstanceId 'rule-cim-id' -Properties @{ InterfaceAlias = @('Any') }
+        $bothInterface = New-NRFixtureFirewallFilter -Type Interface -InstanceId 'rule-both-id' -Properties @{ InterfaceAlias = @('Any') }
+        $cimInterfaceType = New-NRFixtureFirewallFilter -Type InterfaceType -InstanceId 'rule-cim-id' -Properties @{ InterfaceType = 'Any' }
+        $bothInterfaceType = New-NRFixtureFirewallFilter -Type InterfaceType -InstanceId 'rule-both-id' -Properties @{ InterfaceType = 'Any' }
+        $cimSecurity = [pscustomobject]@{ InstanceID = 'rule-cim-id'; LocalUsers = 'O:LSD:(A;;CC;;;S-1-5-21-1001)'; RemoteUsers = 'Any'; RemoteMachines = 'Any'; Authentication = 'NotRequired'; Encryption = 'NotRequired'; OverrideBlockRules = $false }
+        $bothSecurity = New-NRFixtureFirewallFilter -Type Security -InstanceId 'rule-both-id' -Properties @{ Authentication = 'NotRequired' }
+        Mock Get-NetFirewallRule -ModuleName PSNetRules { @($cimRule, $bothRule) }
+        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules { @($cimAddress, $bothAddress) }
+        Mock Get-NetFirewallApplicationFilter -ModuleName PSNetRules { @($cimApplication, $bothApplication) }
+        Mock Get-NetFirewallPortFilter -ModuleName PSNetRules { @($cimPort, $bothPort) }
+        Mock Get-NetFirewallServiceFilter -ModuleName PSNetRules { @($cimService, $bothService) }
+        Mock Get-NetFirewallInterfaceFilter -ModuleName PSNetRules { @($cimInterface, $bothInterface) }
+        Mock Get-NetFirewallInterfaceTypeFilter -ModuleName PSNetRules { @($cimInterfaceType, $bothInterfaceType) }
+        Mock Get-NetFirewallSecurityFilter -ModuleName PSNetRules { @($cimSecurity, $bothSecurity) }
+        Mock Write-Progress -ModuleName PSNetRules {}
+
+        $inventory = Invoke-NRPrivateFunction -Name Get-NRFirewallRuleComparisonInventory -Parameters @{
+            PolicyStore = 'PersistentStore'
+        }
+        $inventory.Entries.Count | Should-Be 2
+        $cimEntry = @($inventory.Entries | Where-Object { $_.Name -eq 'Rule-Cim' })[0]
+        $cimEntry.Fields['Application.AppPath'].Value | Should-Be 'C:\cim\app.exe'
+        $cimEntry.Fields['Application.Program'].Value | Should-Be 'C:\cim\app.exe'
+        $cimEntry.Fields['Port.DynamicTransport'].Value | Should-Be 'Any'
+        $cimEntry.Fields['Port.DynamicTarget'].Value | Should-Be 'Any'
+        $cimEntry.Fields['Service.ServiceName'].Value | Should-Be 'ExampleSvc'
+        $cimEntry.Fields['Service.Service'].Value | Should-Be 'ExampleSvc'
+        $cimEntry.Fields['Security.LocalUsers'].Value | Should-Be 'O:LSD:(A;;CC;;;S-1-5-21-1001)'
+        $cimEntry.Fields['Security.LocalUser'].Value | Should-Be 'O:LSD:(A;;CC;;;S-1-5-21-1001)'
+        $cimEntry.Fields['Security.RemoteUser'].Value | Should-Be 'Any'
+        $cimEntry.Fields['Security.RemoteMachine'].Value | Should-Be 'Any'
+        $bothEntry = @($inventory.Entries | Where-Object { $_.Name -eq 'Rule-Both' })[0]
+        $bothEntry.Fields['Application.Program'].Value | Should-Be 'C:\record\app.exe'
+    }
+
     It 'uses associated-rule fallback when a bulk filter query fails' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         $address = [pscustomobject]@{ InstanceID = 'rule-a-id'; LocalAddress = @('Any'); RemoteAddress = @('Any') }
         Mock Get-NetFirewallRule -ModuleName PSNetRules { @($rule) }
-        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules {
-            param($AssociatedNetFirewallRule)
-            if ($null -ne $AssociatedNetFirewallRule) { return $address }
-            throw 'bulk address query failed'
-        }
+        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules { throw 'bulk address query failed' }
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules { @($address) }
         Mock Get-NetFirewallApplicationFilter -ModuleName PSNetRules { @([pscustomobject]@{ InstanceID = 'rule-a-id'; Program = 'Any' }) }
         Mock Get-NetFirewallPortFilter -ModuleName PSNetRules { @([pscustomobject]@{ InstanceID = 'rule-a-id'; Protocol = 'TCP' }) }
         Mock Get-NetFirewallServiceFilter -ModuleName PSNetRules { @([pscustomobject]@{ InstanceID = 'rule-a-id'; Service = 'Any' }) }
@@ -2958,13 +2821,17 @@ Describe 'PSNetRules comparison inventory and state normalization' {
         $inventory.Entries[0].IsComplete | Should-Be $true
         $inventory.BulkFilterWarnings.Count | Should-Be 1
         $inventory.BulkFilterWarnings[0].Filter | Should-Be 'Address'
-        Should-Invoke Get-NetFirewallAddressFilter -ModuleName PSNetRules -Times 2 -Exactly
+        Should-Invoke Get-NetFirewallAddressFilter -ModuleName PSNetRules -Times 1 -Exactly
+        Should-Invoke Get-NRAssociatedComparisonFilter -ModuleName PSNetRules -Times 1 -Exactly
     }
 
     It 'marks a rule incomplete when both bulk and associated filter queries fail' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         Mock Get-NetFirewallRule -ModuleName PSNetRules { @($rule) }
         Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules {
+            throw 'address query unavailable'
+        }
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules {
             throw 'address query unavailable'
         }
         Mock Get-NetFirewallApplicationFilter -ModuleName PSNetRules { @([pscustomobject]@{ InstanceID = 'rule-a-id'; Program = 'Any' }) }
@@ -3254,6 +3121,9 @@ Describe 'PSNetRules generated change script branches' {
         $generated | Should-MatchString 'Set-NetFirewallProfile'
         $generated | Should-MatchString 'Remove-DnsClientNrptRule'
         $generated | Should-MatchString 'Add-DnsClientNrptRule'
+        $generated | Should-MatchString 'Save-NRGeneratedNrptState'
+        $generated | Should-NotMatchString 'Read-NRStateFile'
+        $generated | Should-NotMatchString 'Write-NRStateFile'
         $generated | Should-MatchString 'corp-dns'
         $generated | Should-MatchString 'gone-dns'
         $generated | Should-MatchString 'new-dns'
@@ -3501,11 +3371,6 @@ Describe 'PSNetRules uncovered branch regression coverage' {
             Should-Throw -ExceptionMessage '*Only FileSystem paths are supported*'
     }
 
-    It 'evaluates the current Windows administrator identity without requiring elevation' {
-        $result = Invoke-NRPrivateFunction -Name Test-NRIsAdministrator
-        ($result -is [bool]) | Should-Be $true
-    }
-
     It 'converts a non-enumerable Firewall property to a one-element string array and skips null array items' {
         $objectValue = [pscustomobject]@{ Child = 'value' }
         $single = Get-NRStringArrayFromObject -Object ([pscustomobject]@{ Value = $objectValue }) -Name Value
@@ -3540,12 +3405,7 @@ Describe 'PSNetRules uncovered branch regression coverage' {
         } } | Should-Throw -ExceptionMessage '*empty logical id*'
     }
 
-    It 'converts CIM, dictionary, sequence, DateTime, Enum, and plain comparison values' {
-        $nativeRule = New-NRFixtureCimFirewallRule -Name 'CimConversionRule' -InstanceId 'cim-conversion-id'
-        $cimValue = Invoke-NRPrivateFunction -Name ConvertTo-NRComparisonPlainValue -Parameters @{ Value = $nativeRule }
-        $cimValue.Name | Should-Be 'CimConversionRule'
-        $cimValue.InstanceID | Should-Be 'cim-conversion-id'
-
+    It 'converts dictionary, sequence, DateTime, Enum, and plain comparison values' {
         $dictionary = Invoke-NRPrivateFunction -Name ConvertTo-NRComparisonDictionaryValue -Parameters @{
             Value = [ordered]@{ z = [System.DayOfWeek]::Monday; a = [datetime]'2025-01-02T03:04:05Z' }
         }
@@ -3590,9 +3450,9 @@ Describe 'PSNetRules uncovered branch regression coverage' {
     }
 
     It 'reports zero and multiple associated comparison filters as incomplete issues' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         $definition = [pscustomobject]@{ Key = 'Address'; Command = 'Get-NetFirewallAddressFilter' }
-        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules { @() }
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules { @() }
         $none = Invoke-NRPrivateFunction -Name Get-NRRuleComparisonFilter -Parameters @{
             Rule = $rule; Definition = $definition; Index = @{}
         }
@@ -3601,9 +3461,9 @@ Describe 'PSNetRules uncovered branch regression coverage' {
     }
 
     It 'reports multiple associated comparison filters without selecting an arbitrary result' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         $definition = [pscustomobject]@{ Key = 'Address'; Command = 'Get-NetFirewallAddressFilter' }
-        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules {
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules {
             @(
                 [pscustomobject]@{ InstanceID = 'one'; LocalAddress = @('Any') },
                 [pscustomobject]@{ InstanceID = 'two'; LocalAddress = @('Any') }
@@ -3617,12 +3477,12 @@ Describe 'PSNetRules uncovered branch regression coverage' {
     }
 
     It 'falls back to the associated-rule query when a bulk index has duplicate filters' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         $definition = [pscustomobject]@{ Key = 'Address'; Command = 'Get-NetFirewallAddressFilter' }
         $bucket = New-Object System.Collections.ArrayList
         $null = $bucket.Add([pscustomobject]@{ InstanceID = 'rule-a-id'; LocalAddress = @('192.0.2.1') })
         $null = $bucket.Add([pscustomobject]@{ InstanceID = 'rule-a-id'; LocalAddress = @('192.0.2.2') })
-        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules {
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules {
             [pscustomobject]@{ InstanceID = 'rule-a-id'; LocalAddress = @('192.0.2.3') }
         }
         $result = Invoke-NRPrivateFunction -Name Get-NRRuleComparisonFilter -Parameters @{
@@ -3630,19 +3490,44 @@ Describe 'PSNetRules uncovered branch regression coverage' {
         }
         @($result.Filter.LocalAddress) | Should-BeCollection @('192.0.2.3')
         $result.Issue | Should-Be $null
-        Should-Invoke Get-NetFirewallAddressFilter -ModuleName PSNetRules -Times 1 -Exactly
+        Should-Invoke Get-NRAssociatedComparisonFilter -ModuleName PSNetRules -Times 1 -Exactly
     }
 
     It 'records an associated-rule filter query exception as an incomplete issue' {
-        $rule = New-NRFixtureCimFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+        $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
         $definition = [pscustomobject]@{ Key = 'Address'; Command = 'Get-NetFirewallAddressFilter' }
-        Mock Get-NetFirewallAddressFilter -ModuleName PSNetRules { throw 'associated address query failed' }
+        Mock Get-NRAssociatedComparisonFilter -ModuleName PSNetRules { throw 'associated address query failed' }
         $result = Invoke-NRPrivateFunction -Name Get-NRRuleComparisonFilter -Parameters @{
             Rule = $rule; Definition = $definition; Index = @{}
         }
         $result.Filter | Should-Be $null
         $result.Issue.Filter | Should-Be 'Address'
         $result.Issue.Detail | Should-MatchString 'associated address query failed'
+    }
+
+    It 'invokes the named filter command with the rule through the associated query seam' {
+        # The seam is exercised against a fake command defined in the module
+        # session state, because the real filter cmdlets only accept a
+        # CimInstance rule, which the plain-object fixtures cannot provide.
+        $module = $script:NetRulesModule
+        & $module {
+            function script:Get-NRFakeAssociatedQuery {
+                param([object] $AssociatedNetFirewallRule)
+                [pscustomobject]@{ InstanceID = [string]$AssociatedNetFirewallRule.InstanceID; LocalAddress = @('192.0.2.9') }
+            }
+        }
+        try {
+            $rule = New-NRFixtureFirewallRule -Name 'Rule-A' -InstanceId 'rule-a-id'
+            $filters = @(Invoke-NRPrivateFunction -Name Get-NRAssociatedComparisonFilter -Parameters @{
+                Command = 'Get-NRFakeAssociatedQuery'; Rule = $rule
+            })
+            $filters.Count | Should-Be 1
+            $filters[0].InstanceID | Should-Be 'rule-a-id'
+            @($filters[0].LocalAddress) | Should-BeCollection @('192.0.2.9')
+        }
+        finally {
+            & $module { Remove-Item -Path Function:Get-NRFakeAssociatedQuery -ErrorAction SilentlyContinue }
+        }
     }
 
     It 'returns Inconclusive when the PersistentStore comparison entry is absent and Mismatch when a field is absent' {
@@ -4844,7 +4729,7 @@ Describe 'PSNetRules uncovered branch regression coverage' {
         { Invoke-NRGenerate -Path $path } | Should-Throw -ExceptionMessage '*already exists*'
         Set-Content -LiteralPath $defaultOutput -Value 'old content'
         Invoke-NRGenerate -Path $path -Force -Confirm:$false | Out-Null
-        (Get-Content -LiteralPath $defaultOutput -Raw) | Should-MatchString 'EXECUTE GENERATED PLAN'
+        (Get-Content -LiteralPath $defaultOutput -Raw) | Should-MatchString 'Generated by PSNetRules generate'
 
         $whatIfPath = Join-Path $TestDrive 'generate-whatif.ps1'
         Invoke-NRGenerate -Path $path -OutputPath $whatIfPath -WhatIf | Out-Null
@@ -5212,5 +5097,290 @@ Describe 'netrules remaining coverage paths' {
 
         $backup | Should-MatchString '\.pre-apply\.\d{8}-\d{6}-\d{3}\.json$'
         Test-Path -LiteralPath $backup -PathType Leaf | Should-Be $true
+    }
+}
+
+Describe 'netrules search command' {
+    BeforeAll {
+        function New-NRSearchFixtureSnapshotEntry {
+            param(
+                [string] $Name = 'SqlRule',
+                [string] $Program = 'C:\Apps\sql.exe'
+            )
+            $fields = @{}
+            $fields['Rule.DisplayName'] = [pscustomobject]@{ Value = 'Allow SQL Server' }
+            $fields['Rule.Description'] = [pscustomobject]@{ Value = '' }
+            $fields['Rule.Group'] = [pscustomobject]@{ Value = '' }
+            $fields['Rule.Enabled'] = [pscustomobject]@{ Value = 'True' }
+            $fields['Rule.Profile'] = [pscustomobject]@{ Value = 'Private' }
+            $fields['Rule.Direction'] = [pscustomobject]@{ Value = 'Inbound' }
+            $fields['Rule.Action'] = [pscustomobject]@{ Value = 'Allow' }
+            $fields['Address.LocalAddress'] = [pscustomobject]@{ Value = @('Any') }
+            $fields['Address.RemoteAddress'] = [pscustomobject]@{ Value = @('10.0.0.0/24') }
+            $fields['Application.AppPath'] = [pscustomobject]@{ Value = $Program }
+            $fields['Application.Package'] = [pscustomobject]@{ Value = 'Any' }
+            $fields['Port.Protocol'] = [pscustomobject]@{ Value = 'TCP' }
+            $fields['Port.LocalPort'] = [pscustomobject]@{ Value = @('1433') }
+            $fields['Port.DynamicTransport'] = [pscustomobject]@{ Value = 'Any' }
+            $fields['Port.RemotePort'] = [pscustomobject]@{ Value = @('Any') }
+            $fields['Service.ServiceName'] = [pscustomobject]@{ Value = 'MSSQLSERVER' }
+            $fields['Security.LocalUsers'] = [pscustomobject]@{ Value = 'O:LSD:(A;;CC;;;S-1-5-18)' }
+            $fields['Security.RemoteUsers'] = [pscustomobject]@{ Value = 'Any' }
+            $fields['Security.RemoteMachines'] = [pscustomobject]@{ Value = 'Any' }
+            return [pscustomobject]@{ Name = $Name; IsComplete = $true; MissingFilters = @(); FilterIssues = @(); Fields = $fields }
+        }
+
+        function New-NRSearchFixtureSnapshot {
+            param([object[]] $Entries)
+            return [pscustomobject][ordered]@{
+                schemaVersion = 1
+                capturedAt = (Get-Date).ToString('o')
+                computerName = $env:COMPUTERNAME
+                configuration = (New-NRFixtureConfiguration)
+                comparison = [pscustomobject]@{
+                    persistentStore = [pscustomobject]@{ PolicyStore = 'PersistentStore'; RuleCount = $Entries.Count; Entries = $Entries; BulkFilterWarnings = @() }
+                    systemDefaults = [pscustomobject]@{ PolicyStore = 'SystemDefaults'; RuleCount = 0; Entries = @(); BulkFilterWarnings = @() }
+                }
+            }
+        }
+    }
+
+    It 'unwraps snapshot comparison entries and deduplicates by Name' {
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @(
+            (New-NRSearchFixtureSnapshotEntry -Name 'SqlRule'),
+            (New-NRSearchFixtureSnapshotEntry -Name 'SqlRule'),
+            (New-NRSearchFixtureSnapshotEntry -Name 'OtherRule')
+        )
+        $rules = @(Get-NRSearchableFirewallRule -Source Snapshot -Snapshot $snapshot)
+        $rules.Count | Should-Be 2
+        $rules[0].Name | Should-Be 'SqlRule'
+        $rules[0].Fields['Rule.Direction'] | Should-Be 'Inbound'
+        $rules[0].Fields['Application.Program'] | Should-Be 'C:\Apps\sql.exe'
+        $rules[0].Fields['Port.LocalPort'][0] | Should-Be '1433'
+        $rules[0].Fields['Port.DynamicTarget'] | Should-Be 'Any'
+        $rules[0].Fields['Service.Service'] | Should-Be 'MSSQLSERVER'
+        $rules[0].Fields['Security.LocalUser'] | Should-Be 'O:LSD:(A;;CC;;;S-1-5-18)'
+    }
+
+    It 'normalizes desired-state records into the same field shape' {
+        $desired = New-NRFixtureConfiguration
+        $rules = @(Get-NRSearchableFirewallRule -Source Desired -Desired $desired)
+        $rules.Count | Should-Be 1
+        $rules[0].Name | Should-Be 'AllowHttps'
+        $rules[0].Fields['Rule.Direction'] | Should-Be 'Inbound'
+        $rules[0].Fields['Application.Program'] | Should-Be 'Any'
+        $rules[0].Fields['Port.LocalPort'][0] | Should-Be '443'
+        $rules[0].Fields['Security.LocalUser'] | Should-Be 'Any'
+    }
+
+    It 'matches direction and action exactly and combines conditions with AND' {
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @((New-NRSearchFixtureSnapshotEntry))
+        $rule = @(Get-NRSearchableFirewallRule -Source Snapshot -Snapshot $snapshot)[0]
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Direction = @('Inbound'); Action = @('Allow') })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Direction = @('Outbound') })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Direction = @('Inbound'); Action = @('Block') })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{})) | Should-Be $true
+    }
+
+    It 'matches text across all fields and ports by exact element' {
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @((New-NRSearchFixtureSnapshotEntry))
+        $rule = @(Get-NRSearchableFirewallRule -Source Snapshot -Snapshot $snapshot)[0]
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Text = 'sql' })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Text = 'MSSQLSERVER' })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Text = 'oracle' })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ LocalPort = @('1433') })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ LocalPort = @('143') })) | Should-Be $false
+    }
+
+    It 'matches SID substrings, name patterns, and the Enabled state' {
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @((New-NRSearchFixtureSnapshotEntry))
+        $rule = @(Get-NRSearchableFirewallRule -Source Snapshot -Snapshot $snapshot)[0]
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Sid = 'S-1-5-18' })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Sid = 'S-1-5-19' })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ NamePattern = 'sql' })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ NamePattern = 'server' })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Enabled = $true })) | Should-Be $true
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Enabled = $false })) | Should-Be $false
+    }
+
+    It 'classifies program path states for the missing-program search' {
+        (Test-NRProgramPathState -Program '') | Should-Be 'NotApplicable'
+        (Test-NRProgramPathState -Program 'Any') | Should-Be 'NotApplicable'
+        (Test-NRProgramPathState -Program 'sql.exe') | Should-Be 'Unverifiable'
+        (Test-NRProgramPathState -Program '%SystemRoot%\System32\sql.exe') | Should-Be 'Unverifiable'
+        $existing = Join-Path $TestDrive 'existing-app.exe'
+        [System.IO.File]::WriteAllText($existing, 'x')
+        (Test-NRProgramPathState -Program $existing) | Should-Be 'Exists'
+        (Test-NRProgramPathState -Program (Join-Path $TestDrive 'missing-app.exe')) | Should-Be 'Missing'
+    }
+
+    It 'searches the snapshot and desired state end to end' {
+        $path = Join-Path $TestDrive 'search.json'
+        Write-NRJsonFile -Path $path -InputObject (New-NRFixtureConfiguration)
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @((New-NRSearchFixtureSnapshotEntry))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject $snapshot
+
+        $snapshotOutput = @(Invoke-NRSearch -Path $path -Direction Inbound -Action Allow) -join [Environment]::NewLine
+        $snapshotOutput | Should-MatchString 'SqlRule'
+        $snapshotOutput | Should-MatchString '1 matched'
+        $noMatchOutput = @(Invoke-NRSearch -Path $path -Direction Outbound) -join [Environment]::NewLine
+        $noMatchOutput | Should-MatchString '0 matched'
+        $desiredOutput = @(Invoke-NRSearch -Path $path -Source Desired -LocalPort '443') -join [Environment]::NewLine
+        $desiredOutput | Should-MatchString 'AllowHttps'
+        { Invoke-NRSearch -Path $path -Enabled -Disabled } | Should-Throw
+    }
+
+    It 'extracts rules whose program file is missing and skips blank or Any programs' {
+        $path = Join-Path $TestDrive 'search-missing.json'
+        $desired = New-NRFixtureConfiguration
+        $stale = New-NRFixtureFirewallRuleRecord -Name 'StaleRule'
+        $stale.filters.application.Program = Join-Path $TestDrive 'gone.exe'
+        $desired.firewallRules = @($stale, (New-NRFixtureFirewallRuleRecord -Name 'AnyProgramRule'))
+        Write-NRJsonFile -Path $path -InputObject $desired
+
+        $output = @(Invoke-NRSearch -Path $path -Source Desired -MissingProgram) -join [Environment]::NewLine
+        $output | Should-MatchString 'StaleRule'
+        $output | Should-MatchString 'Missing'
+        $output | Should-MatchString '1 matched'
+    }
+
+    It 'extracts snapshot rules whose program file is missing through the CIM AppPath field' {
+        $path = Join-Path $TestDrive 'search-missing-snapshot.json'
+        Write-NRJsonFile -Path $path -InputObject (New-NRFixtureConfiguration)
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @(
+            (New-NRSearchFixtureSnapshotEntry -Name 'StaleSnapshotRule' -Program 'C:\Apps\gone.exe'),
+            (New-NRSearchFixtureSnapshotEntry -Name 'AnyProgramRule' -Program 'Any')
+        )
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject $snapshot
+
+        $output = @(Invoke-NRSearch -Path $path -MissingProgram) -join [Environment]::NewLine
+        $output | Should-MatchString 'StaleSnapshotRule'
+        $output | Should-MatchString 'Missing'
+        $output | Should-MatchString '1 matched'
+        $byProgram = @(Invoke-NRSearch -Path $path -Program 'gone') -join [Environment]::NewLine
+        $byProgram | Should-MatchString 'StaleSnapshotRule'
+        $byProgram | Should-MatchString '1 matched'
+    }
+
+    It 'fails when the snapshot has not been captured' {
+        $path = Join-Path $TestDrive 'search-nosnapshot.json'
+        Write-NRJsonFile -Path $path -InputObject (New-NRFixtureConfiguration)
+        { Invoke-NRSearch -Path $path } | Should-Throw '*Run capture first*'
+    }
+
+    It 'covers the search helper branches directly' {
+        (ConvertTo-NRSearchText -Value $null) | Should-Be ''
+        (ConvertTo-NRSearchText -Value 'abc') | Should-Be 'abc'
+        (ConvertTo-NRSearchText -Value @('a', 'b')) | Should-Be 'a b'
+        (ConvertTo-NRSearchText -Value ([pscustomobject]@{ A = 1 })) | Should-Be '{"A":1}'
+
+        (Test-NRSearchValueContains -Value 'hello' -Pattern 'ell') | Should-Be $true
+        (Test-NRSearchValueContains -Value 'hello' -Pattern 'xyz') | Should-Be $false
+        (Test-NRSearchFieldContains -Fields @{} -Name 'Rule.Direction' -Pattern 'In') | Should-Be $false
+
+        (Test-NRSearchFieldHasExactValue -Fields @{} -Name 'Port.LocalPort' -Values @('1433')) | Should-Be $false
+        (Test-NRSearchFieldHasExactValue -Fields @{ 'Port.LocalPort' = '1433' } -Name 'Port.LocalPort' -Values @('1433')) | Should-Be $true
+        (Test-NRSearchFieldHasExactValue -Fields @{ 'Port.LocalPort' = @('80', '443') } -Name 'Port.LocalPort' -Values @('443')) | Should-Be $true
+        (Test-NRSearchFieldHasExactValue -Fields @{ 'Port.LocalPort' = @('80', '443') } -Name 'Port.LocalPort' -Values @('22')) | Should-Be $false
+
+        (Test-NRSearchExactCondition -Fields @{} -FieldName 'Rule.Direction' -Values @('Inbound')) | Should-Be $false
+        (Test-NRSearchExactCondition -Fields @{} -FieldName 'Rule.Direction' -Values $null) | Should-Be $true
+
+        $enabledQuery = [pscustomobject]@{ Enabled = $true }
+        (Test-NRSearchEnabledCondition -Fields @{ 'Rule.Enabled' = $true } -Query $enabledQuery) | Should-Be $true
+        (Test-NRSearchEnabledCondition -Fields @{ 'Rule.Enabled' = $false } -Query $enabledQuery) | Should-Be $false
+        (Test-NRSearchEnabledCondition -Fields @{} -Query $enabledQuery) | Should-Be $false
+
+        $programFields = @{ 'Application.Program' = 'C:\Apps\tool.exe' }
+        (Test-NRSearchSubstringCondition -Fields $programFields -FieldName 'Application.Program' -Pattern 'tool') | Should-Be $true
+        (Test-NRSearchSubstringCondition -Fields $programFields -FieldName 'Application.Program' -Pattern 'nomatch') | Should-Be $false
+        (Test-NRSearchSubstringCondition -Fields $programFields -FieldName 'Application.Program' -Pattern $null) | Should-Be $true
+
+        (Test-NRObjectLike -Value ([pscustomobject]@{})) | Should-Be $false
+        (Invoke-NRPrivateFunction -Name Test-NRPropertyValueObjectLike -Parameters @{ Value = [pscustomobject]@{} }) | Should-Be $false
+
+        (Invoke-NRPrivateFunction -Name Test-NRStringSequenceEqual -Parameters @{ Left = @($null); Right = @($null) }) | Should-Be $true
+        (Invoke-NRPrivateFunction -Name Test-NRStringSequenceEqual -Parameters @{ Left = @($null); Right = @('a') }) | Should-Be $false
+        (Invoke-NRPrivateFunction -Name Test-NRStringSequenceEqual -Parameters @{ Left = @(1); Right = @(1) }) | Should-Be $null
+        (Invoke-NRPrivateFunction -Name Test-NRStringSequenceEqual -Parameters @{ Left = @('a', 'b'); Right = @('a', 1) }) | Should-Be $null
+
+        (Test-NRProgramPathState -Program 'C:\%APPDATA%\tool.exe') | Should-Be 'Unverifiable'
+        (Test-NRProgramPathState -Program 'tool.exe') | Should-Be 'Unverifiable'
+    }
+
+    It 'rejects rules through each remaining matcher condition' {
+        $rule = ConvertTo-NRSearchableSnapshotRule -Entry (New-NRSearchFixtureSnapshotEntry)
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Program = 'nomatch' })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ LocalPort = @('9999') })) | Should-Be $false
+        (Test-NRFirewallRuleSearchMatch -Rule $rule -Query ([pscustomobject]@{ Sid = 'S-1-5-999' })) | Should-Be $false
+    }
+
+    It 'tolerates null entries and missing filter sections in search sources' {
+        $snapshot = New-NRSearchFixtureSnapshot -Entries @($null, (New-NRSearchFixtureSnapshotEntry))
+        @(Get-NRSearchableFirewallRule -Source Snapshot -Snapshot $snapshot).Count | Should-Be 1
+
+        $desired = New-NRFixtureConfiguration
+        $record = New-NRFixtureFirewallRuleRecord -Name 'PartialRule'
+        $record.filters.PSObject.Properties.Remove('security')
+        $desired.firewallRules = @($null, $record)
+        $rules = @(Get-NRSearchableFirewallRule -Source Desired -Desired $desired)
+        $rules.Count | Should-Be 1
+        $rules[0].Fields.Contains('Security.LocalUser') | Should-Be $false
+    }
+
+    It 'formats results for rules without display names or summary fields' {
+        $result = [pscustomobject]@{
+            Rule = [pscustomobject]@{ Name = 'BareRule'; Fields = @{ 'Rule.Direction' = 'Inbound' } }
+            ProgramState = $null
+        }
+        $lines = @(Format-NRSearchResults -Results @($result) -Source 'Desired')
+        ($lines -join [Environment]::NewLine) | Should-MatchString 'BareRule'
+        ($lines -join [Environment]::NewLine) | Should-MatchString 'Direction: Inbound'
+    }
+
+    It 'skips rules without a program when extracting missing programs' {
+        $rule = [pscustomobject]@{ Name = 'NoProgramRule'; Fields = @{} }
+        @(Get-NRSearchResults -Rules @($rule) -Query ([pscustomobject]@{}) -MissingProgram).Count | Should-Be 0
+    }
+
+    It 'filters by Enabled and Disabled end to end and validates its sources' {
+        $path = Join-Path $TestDrive 'search-enabled.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.firewallRules = @(
+            (New-NRFixtureFirewallRuleRecord -Name 'EnabledRule' -Enabled 'True'),
+            (New-NRFixtureFirewallRuleRecord -Name 'DisabledRule' -Enabled 'False')
+        )
+        Write-NRJsonFile -Path $path -InputObject $desired
+
+        $enabledOutput = @(Invoke-NRSearch -Path $path -Source Desired -Enabled) -join [Environment]::NewLine
+        $enabledOutput | Should-MatchString 'EnabledRule'
+        $enabledOutput | Should-MatchString '1 matched'
+        $disabledOutput = @(Invoke-NRSearch -Path $path -Source Desired -Disabled) -join [Environment]::NewLine
+        $disabledOutput | Should-MatchString 'DisabledRule'
+        $disabledOutput | Should-MatchString '1 matched'
+
+        { Get-NRSearchSourceData -Source Desired -Path (Join-Path $TestDrive 'missing-desired.json') } | Should-Throw '*Desired-state file not found*'
+
+        $foreign = New-NRSearchFixtureSnapshot -Entries @((New-NRSearchFixtureSnapshotEntry))
+        $foreign.computerName = 'OTHER-PC-XYZ'
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject $foreign
+        { Get-NRSearchSourceData -Source Snapshot -Path $path } | Should-Throw '*Snapshot belongs to computer*'
+    }
+}
+
+Describe 'PSNetRules search through the command-line entry point' {
+    It 'rejects search-only parameters outside search' {
+        $result = Invoke-NRRootScriptInChildProcess -Arguments @('diff', '-Text', 'sql')
+        $result.ExitCode | Should-Be 1
+        $result.StandardError | Should-MatchString '-Text is supported only by search'
+    }
+
+    It 'routes search to the desired state through the CLI' {
+        $path = Join-Path $TestDrive 'entrypoint-search.json'
+        Write-NRJsonFile -Path $path -InputObject (New-NRFixtureConfiguration)
+        $result = Invoke-NRRootScriptInChildProcess -Arguments @('search', '-Path', $path, '-Source', 'Desired', '-LocalPort', '443')
+        Assert-NRChildProcessSuccess -Result $result -Context 'CLI search'
+        $result.StandardOutput | Should-MatchString 'AllowHttps'
+        $result.StandardOutput | Should-MatchString '1 matched'
     }
 }

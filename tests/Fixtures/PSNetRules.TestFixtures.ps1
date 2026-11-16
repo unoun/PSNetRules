@@ -337,6 +337,18 @@ function New-NRFixtureCimFirewallRule {
         -ClientOnly -Property @{ Name = $Name; InstanceID = $InstanceId }
 }
 
+function New-NRFixtureFirewallRule {
+    [CmdletBinding()]
+    param([string] $Name = 'Rule-A', [string] $InstanceId = 'rule-a-id')
+
+    # Plain-object stand-in for a firewall rule object. The logic under test
+    # reads only Name and InstanceID, and the filter cmdlets are mocked, so a
+    # real CimInstance is not required. Tests that do require a real
+    # CimInstance live in PSNetRules.Windows.Tests.ps1 and use
+    # New-NRFixtureCimFirewallRule instead.
+    return [pscustomobject]@{ Name = $Name; InstanceID = $InstanceId }
+}
+
 function New-NRFixtureConfiguration {
     [CmdletBinding()]
     param([string] $Port = '443')

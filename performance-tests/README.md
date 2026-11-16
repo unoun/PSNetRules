@@ -41,9 +41,9 @@ Run from the repository root:
 .\performance-tests\Measure-PSNetRulesPerformance.ps1
 ```
 
-The default mode is `Measure`, with three measured iterations and no warm-up. Each metric is summarized by the median of its samples. The console also reports one-time synthetic-data setup, Diff-input preparation, and total benchmark elapsed time; these figures are diagnostic and are not included in the performance gate.
+The default mode is `Measure`, with five measured iterations and one warm-up. The warm-up matters: without it, first-run compilation and cache effects land in the first measured sample and the min/max spread within a single run can exceed 2x. Each metric is summarized by the median of its samples. The console also reports one-time synthetic-data setup, Diff-input preparation, and total benchmark elapsed time; these figures are diagnostic and are not included in the performance gate.
 
-Use the same `-Iterations` and `-WarmupIterations` values when initializing and testing a baseline. The defaults are `3` and `0`.
+Use the same `-Iterations` and `-WarmupIterations` values when initializing and testing a baseline. The defaults are `5` and `1`.
 
 ## Capture metrics
 
@@ -97,9 +97,19 @@ Baseline initialization performs a fresh measurement and writes its medians to t
     -BaselinePath '.\performance-tests\PerformanceBaseline.json'
 ```
 
-The test compares the median of every measured metric with the baseline. A metric that is **5% or more slower** fails, including a regression of exactly 5%. The baseline must match the current PowerShell / OS / process environment, workload shape and classification distribution, iteration count, and warm-up count.
+The test compares the median of every measured metric with the baseline. A metric that is **5% or more slower** fails by default, including a regression of exactly 5%. The limit is a parameter (`-RegressionLimitPercent`); set it from the noise you actually observe — if repeated `Measure` runs on an unchanged tree spread a metric's median by more than the limit, the gate measures noise, not regressions, and the limit (or the iteration count) needs to go up. The baseline must match the current PowerShell / OS / process environment, workload shape and classification distribution, iteration count, and warm-up count.
 
 Use the same machine and PowerShell host for baseline and candidate runs. Review and retain the baseline as a controlled input; do not regenerate it merely to make a regression pass.
+
+## Workload counters (diagnosis)
+
+Timings say *that* a stage is slow; they are too noisy to say *why*. For diagnosis, `-WorkloadCounters` instruments the in-memory copy of the module source (the file on disk is never modified) with a call counter at the top of each function in the harness's target list — the comparison and classification hot paths — and reports how many times each was called during the Capture and Diff scenarios.
+
+```powershell
+.\performance-tests\Measure-PSNetRulesPerformance.ps1 -WorkloadCounters -Iterations 1 -WarmupIterations 0
+```
+
+Counts are deterministic: the same workload always produces the same counts, so a change that reduces the work shows up as a lower count even when the timing difference is inside the noise. Counts accumulate over every execution of a scenario in the run (warm-ups plus measured iterations), which is why the example above uses one iteration and no warm-up for exact per-pass counts. The counters are included in the report JSON when `-OutputPath` is supplied. Instrumentation fails loudly if a target function is renamed or removed, so the list cannot silently go stale.
 
 ## Optional report output
 

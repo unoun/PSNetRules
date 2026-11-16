@@ -295,6 +295,76 @@ Describe 'netrules Windows runtime object and Mock compatibility contract' {
         (ConvertTo-NRCanonicalJson $mockCompatibleRecord) | Should-Be (ConvertTo-NRCanonicalJson $nativeRecord)
     }
 
+    It 'exposes every valued record field in comparison entries built from real rules' {
+        $firewallCapture = Get-NRFirewallRules -IncludeComparisonSource
+        if ($firewallCapture.Records.Count -eq 0) {
+            Set-ItResult -Skipped -Because 'The local PersistentStore contains no Firewall rules to use as a native contract sample.'
+            return
+        }
+        $persistent = Get-NRFirewallRuleComparisonInventory -PolicyStore PersistentStore -CaptureSource $firewallCapture.ComparisonSource
+        $recordsByName = @{}
+        foreach ($record in $firewallCapture.Records) { $recordsByName[[string]$record.name] = $record }
+
+        # The vocabulary contract: whatever field a record read a value for,
+        # the comparison entry for the same rule must expose under the same
+        # field name. Entry values intentionally keep the raw CIM
+        # representation (numeric enums, null for unrestricted addresses),
+        # so only names are contracted here, not value representations.
+        # Fields the record left null impose no requirement (the underlying
+        # instance may not carry the property). All violations are collected
+        # so one run reports every gap.
+        $violations = New-Object 'System.Collections.Generic.List[string]'
+        foreach ($entry in $persistent.Entries) {
+            $record = $recordsByName[[string]$entry.Name]
+            if ($null -eq $record) { continue }
+            $missingSections = @($entry.MissingFilters)
+            foreach ($spec in @(Get-NRFirewallFilterSpecs)) {
+                $section = $spec.JsonName.Substring(0, 1).ToUpperInvariant() + $spec.JsonName.Substring(1)
+                if ($missingSections -contains $section) { continue }
+                $recordFilter = Get-NRProperty (Get-NRProperty $record 'filters') $spec.JsonName
+                foreach ($field in $spec.Fields) {
+                    $recordValue = Get-NRProperty $recordFilter $field
+                    if ($null -eq $recordValue) { continue }
+                    $key = "$section.$field"
+                    if (-not $entry.Fields.Contains($key)) {
+                        $violations.Add("$($entry.Name): missing '$key'")
+                    }
+                }
+            }
+        }
+        $shown = @($violations | Select-Object -First 10) -join '; '
+        if ($violations.Count -gt 10) { $shown += "; and $($violations.Count - 10) more" }
+        $violations.Count | Should-Be 0 -Because $shown
+    }
+
+    It 'finds the program of a real rule through the snapshot search conversion' {
+        $firewallCapture = Get-NRFirewallRules -IncludeComparisonSource
+        $persistent = Get-NRFirewallRuleComparisonInventory -PolicyStore PersistentStore -CaptureSource $firewallCapture.ComparisonSource
+        $snapshot = [pscustomobject]@{
+            comparison = [pscustomobject]@{ persistentStore = $persistent }
+        }
+        $searchable = @(Invoke-NRContractPrivateFunction -Name 'Get-NRSearchableFirewallRule' -Parameters @{
+            Source = 'Snapshot'; Snapshot = $snapshot
+        })
+        $searchable.Count | Should-Be $persistent.Entries.Count
+
+        $sample = $null
+        foreach ($record in $firewallCapture.Records) {
+            $program = [string](Get-NRProperty (Get-NRProperty (Get-NRProperty $record 'filters') 'application') 'Program')
+            if (-not [string]::IsNullOrWhiteSpace($program) -and $program -ne 'Any') {
+                $sample = [pscustomobject]@{ Name = [string]$record.name; Program = $program }
+                break
+            }
+        }
+        if ($null -eq $sample) {
+            Set-ItResult -Skipped -Because 'No local Firewall rule has a program path to use as a search contract sample.'
+            return
+        }
+        $match = @($searchable | Where-Object { $_.Name -eq $sample.Name })
+        $match.Count | Should-Be 1
+        [string]$match[0].Fields['Application.Program'] | Should-Be $sample.Program
+    }
+
     It 'projects a real NRPT CIM object identically when represented by the PSCustomObject fixture used by Unit mocks' {
         $nativeRules = @(Get-DnsClientNrptRule -ErrorAction Stop)
         if ($nativeRules.Count -eq 0) {

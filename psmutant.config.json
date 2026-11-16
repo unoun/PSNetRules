@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Fortigi/PSMutant/main/schemas/v1/config.schema.json",
+  "_comment": "Goal configuration: every operator enabled and thresholds.break 100, so the run only passes with zero surviving mutants. Mutants that provably cannot change behaviour are declared under 'equivalents' with a reason each; PSMutant fails the run if a declaration is killed, matches nothing, or matches more than one mutant.",
+  "_sandboxSubtreesComment": "src and tests are the PSMutant defaults. schema is read by one unit test (../schema relative to tests/). PSNetRules.ps1 is the CLI entry point at the repository root: the child-process CLI tests resolve it as ../PSNetRules.ps1 from tests/, so it must exist inside the sandbox at the same relative position. It is a file, not a directory; whether PSMutant accepts a file entry here is what the trial run verifies.",
+  "coveredLinesOnly": true,
+  "mutate": [
+    "src/PSNetRules.psm1"
+  ],
+  "reportPath": "reports/ps-mutation.json",
+  "sandboxSubtrees": [
+    "src",
+    "tests",
+    "schema",
+    "PSNetRules.ps1"
+  ],
+  "tests": {
+    "src/PSNetRules.psm1": [
+      "tests/PSNetRules.Tests.ps1",
+      "tests/PSNetRules.Windows.Tests.ps1"
+    ]
+  },
+  "thresholds": {
+    "high": 85,
+    "low": 70,
+    "break": 100
+  },
+  "operators": [
+    "BinaryOperator",
+    "BooleanLiteral",
+    "NumberLiteral",
+    "NegationRemoval",
+    "ConditionalBoundary",
+    "ConditionForcing",
+    "ReturnValue",
+    "ComparisonOperator",
+    "CaseSensitivity",
+    "BitwiseOperator",
+    "StringOperatorRemoval",
+    "NumberBoundary",
+    "ArithmeticOperator"
+  ]
+}
