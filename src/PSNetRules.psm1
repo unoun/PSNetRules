@@ -3979,6 +3979,51 @@ function Get-NRAdoptSelection {
     }
     return $selected.ToArray()
 }
+function Assert-NRAdoptNrptArguments {
+    [CmdletBinding()]
+    param([bool] $New, [bool] $Update, [bool] $Rename, [string[]] $Name)
+    if ($New) { throw 'Bulk adoption (-New) is not supported for NRPT rules. Specify -Name with the NRPT rule ids to adopt.' }
+    if ($Rename) { throw '-Rename is not supported for NRPT rules.' }
+    if (-not $Name -or $Name.Count -eq 0) { throw 'Adopting NRPT rules requires -Name with the NRPT rule ids from the latest capture snapshot.' }
+}
+
+function Assert-NRAdoptNamedNrptRule {
+    [CmdletBinding()]
+    param(
+        [string] $Id,
+        [bool] $Update,
+        [hashtable] $CurrentById,
+        [hashtable] $DesiredById
+    )
+    if ([string]::IsNullOrWhiteSpace($Id)) { throw 'NRPT rule id cannot be empty.' }
+    if (-not $CurrentById.ContainsKey($Id)) { throw "NRPT rule '$Id' is not present in the latest capture snapshot." }
+    if ($Update) {
+        if (-not $DesiredById.ContainsKey($Id)) {
+            throw "NRPT rule '$Id' is not currently managed; use adopt -Nrpt -Name '$Id' to adopt it."
+        }
+        return
+    }
+    if ($DesiredById.ContainsKey($Id)) {
+        throw "NRPT rule '$Id' is already managed. Use -Update -Name '$Id' to adopt its current settings."
+    }
+}
+
+function Get-NRAdoptNrptSelection {
+    [CmdletBinding()]
+    param(
+        [bool] $Update,
+        [string[]] $Names,
+        [hashtable] $CurrentById,
+        [hashtable] $DesiredById
+    )
+    $selected = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($id in $Names) {
+        Assert-NRAdoptNamedNrptRule -Id $id -Update $Update -CurrentById $CurrentById -DesiredById $DesiredById
+        if (-not ($selected -contains $id)) { $selected.Add($id) }
+    }
+    return $selected.ToArray()
+}
+
 function Get-NRAdoptRenameSelection {
     [CmdletBinding()]
     param([string[]] $Names, [object[]] $Classifications)
@@ -4134,6 +4179,96 @@ function Set-NRAdoptedConfiguration {
     return [pscustomobject]@{ Desired = $Desired; State = $State }
 }
 
+function Write-NRAdoptNrptPreview {
+    [CmdletBinding()]
+    param(
+        [string[]] $Ids,
+        [hashtable] $CurrentById,
+        [bool] $Update
+    )
+    $verb = if ($Update) { 'update' } else { 'adopt' }
+    Write-Output ("NRPT rules to {0}: {1}" -f $verb, $Ids.Count)
+    foreach ($id in $Ids) {
+        $record = $CurrentById[$id]
+        Write-Output ("  {0}" -f $id)
+        $displayName = [string](Get-NRProperty $record 'DisplayName')
+        if (-not [string]::IsNullOrWhiteSpace($displayName)) {
+            Write-Output ("      DisplayName: {0}" -f $displayName)
+        }
+        $namespaces = @(Get-NRProperty $record 'Namespace')
+        Write-Output ("      Namespace: {0}" -f ($namespaces -join ', '))
+        $servers = @(Get-NRProperty $record 'NameServers')
+        if ($servers.Count -gt 0) {
+            Write-Output ("      NameServers: {0}" -f ($servers -join ', '))
+        }
+    }
+}
+
+function Set-NRAdoptedNrptConfiguration {
+    [CmdletBinding()]
+    param(
+        [object] $Desired,
+        [string[]] $Ids,
+        [hashtable] $CurrentById
+    )
+    $selected = @{}
+    foreach ($id in $Ids) { $selected[[string]$id] = $true }
+    $records = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($record in $Desired.nrptRules) {
+        if (-not $selected.ContainsKey([string]$record.id)) { $records.Add($record) }
+    }
+    foreach ($id in $Ids) { $records.Add($CurrentById[$id]) }
+    $Desired.nrptRules = @($records.ToArray() | Sort-Object id)
+    return [pscustomobject]@{ Desired = $Desired }
+}
+
+function Invoke-NRAdoptNrptRequest {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [object] $Desired,
+        [Parameter(Mandatory = $true)] [object] $Snapshot,
+        [bool] $Update,
+        [string[]] $Names,
+        [System.Collections.IDictionary] $BoundParameters
+    )
+    $nrptParameters = @{
+        Path = $Path; Desired = $Desired; Snapshot = $Snapshot
+        Update = $Update; Names = $Names; WhatIf = $WhatIfPreference
+    }
+    if ($BoundParameters.ContainsKey('Confirm')) { $nrptParameters['Confirm'] = [bool]$BoundParameters['Confirm'] }
+    Invoke-NRAdoptNrpt @nrptParameters
+}
+
+function Invoke-NRAdoptNrpt {
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    param(
+        [Parameter(Mandatory = $true)] [string] $Path,
+        [Parameter(Mandatory = $true)] [object] $Desired,
+        [Parameter(Mandatory = $true)] [object] $Snapshot,
+        [bool] $Update,
+        [string[]] $Names
+    )
+    $current = Get-NRMapByKey -Items @($Snapshot.configuration.nrptRules) -KeyProperty 'id'
+    $desiredById = Get-NRMapByKey -Items @($Desired.nrptRules) -KeyProperty 'id'
+    $selected = @(Get-NRAdoptNrptSelection -Update $Update -Names $Names -CurrentById $current -DesiredById $desiredById)
+    if ($selected.Count -eq 0) {
+        Write-Output 'No NRPT rules to adopt.'
+        return
+    }
+    Write-NRAdoptNrptPreview -Ids $selected -CurrentById $current -Update $Update
+    $action = if ($Update) { 'Update desired settings from capture snapshot' } else { 'Add NRPT rules to managed desired state' }
+    if (-not $PSCmdlet.ShouldProcess(("{0} NRPT rules in {1}" -f $selected.Count, $Path), $action)) { return }
+    foreach ($backup in @(New-NRFileBackup -Paths @($Path) -ConfigurationPath $Path -Suffix 'pre-adopt')) {
+        Write-Output ("Backup: {0}" -f $backup)
+    }
+    $updated = Set-NRAdoptedNrptConfiguration -Desired $Desired -Ids $selected -CurrentById $current
+    Assert-NRConfiguration -Configuration $updated.Desired | Out-Null
+    Write-NRJsonFile -Path $Path -InputObject $updated.Desired
+    $verb = if ($Update) { 'Updated' } else { 'Adopted' }
+    Write-Output ("{0} {1} NRPT rules." -f $verb, $selected.Count)
+}
+
 function Invoke-NRAdoptRename {
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
     param(
@@ -4166,9 +4301,14 @@ function Invoke-NRAdopt {
         [switch] $New,
         [switch] $Update,
         [switch] $Rename,
+        [switch] $Nrpt,
         [string[]] $Name
     )
-    Assert-NRAdoptArguments -New $New.IsPresent -Update $Update.IsPresent -Rename $Rename.IsPresent -Name $Name
+    if ($Nrpt) {
+        Assert-NRAdoptNrptArguments -New $New.IsPresent -Update $Update.IsPresent -Rename $Rename.IsPresent -Name $Name
+    } else {
+        Assert-NRAdoptArguments -New $New.IsPresent -Update $Update.IsPresent -Rename $Rename.IsPresent -Name $Name
+    }
     $Path = Resolve-NRFilePath -Path $Path
     $snapshotPath = Get-NRSnapshotPath -Path $Path
     $statePath = Get-NRStatePath -Path $Path
@@ -4177,6 +4317,10 @@ function Invoke-NRAdopt {
     $snapshot = Read-NRSnapshot -Path $snapshotPath
     if ([string]$snapshot.computerName -cne [string]$env:COMPUTERNAME) {
         throw "Snapshot belongs to computer '$($snapshot.computerName)', not '$env:COMPUTERNAME'."
+    }
+    if ($Nrpt) {
+        Invoke-NRAdoptNrptRequest -Path $Path -Desired $desired -Snapshot $snapshot -Update $Update.IsPresent -Names $Name -BoundParameters $PSBoundParameters -WhatIf:$WhatIfPreference
+        return
     }
     $state = Read-NRStateFile -Path $statePath
     $classifications = @(Get-NRFirewallRuleClassification -Snapshot $snapshot -Desired $desired -State $state)

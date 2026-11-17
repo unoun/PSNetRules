@@ -24,8 +24,11 @@ Replace the desired representation of the named adopted Firewall Rule with its l
 .PARAMETER Rename
 Accept uniquely matched name-only replacements reported by diff. Without -Name, accept all detected replacements; with -Name, specify the old Name.
 
+.PARAMETER Nrpt
+Adopt NRPT Rules instead of Firewall Rules. Valid only with adopt and -Name, where each -Name value is an NRPT Rule id from the latest capture (typically the Windows-assigned GUID name). Cannot be combined with -New or -Rename. Adopted NRPT Rules keep their captured id; no logical name is assigned.
+
 .PARAMETER Name
-For adopt, select Firewall Rule Names to adopt, or to update when used with -Update. With -Rename, specify old Names. For unmanage, exclude the named Rules from management without changing Windows Firewall.
+For adopt, select Firewall Rule Names to adopt, or to update when used with -Update. With -Rename, specify old Names. With -Nrpt, specify NRPT Rule ids instead. For unmanage, exclude the named Rules from management without changing Windows Firewall.
 
 .PARAMETER OutputPath
 Output file for the generated PowerShell script. Valid only with generate. Defaults to a .generate.ps1 file beside the desired-state file.
@@ -113,6 +116,10 @@ Update one adopted Rule from the latest capture.
 Preview acceptance of one detected name-only replacement.
 
 .EXAMPLE
+.\PSNetRules.ps1 adopt -Nrpt -Name '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+Adopt one captured NRPT Rule into the desired state under its captured id.
+
+.EXAMPLE
 .\PSNetRules.ps1 unmanage -Name 'Rule-Name' -WhatIf
 Preview excluding a Rule from management without deleting it from Windows.
 
@@ -149,6 +156,8 @@ param(
     [switch] $Update,
 
     [switch] $Rename,
+
+    [switch] $Nrpt,
 
     [string[]] $Name,
 
@@ -214,6 +223,9 @@ try {
     if (($New -or $Update -or $Rename) -and $Command -ne 'adopt') {
         throw '-New, -Update, and -Rename are supported only by adopt.'
     }
+    if ($Nrpt -and $Command -ne 'adopt') {
+        throw '-Nrpt is supported only by adopt.'
+    }
     if ($PSBoundParameters.ContainsKey('Name') -and $Command -notin @('adopt', 'unmanage')) {
         throw '-Name is supported only by adopt and unmanage.'
     }
@@ -238,7 +250,7 @@ try {
         'diff'     { Invoke-NRDiff -Path $Path -Status $Status }
         'validate' { Invoke-NRValidate -Path $Path }
         'adopt' {
-            $operationParameters = @{ Path = $Path; New = $New; Update = $Update; Rename = $Rename; Name = $Name; WhatIf = $WhatIfPreference }
+            $operationParameters = @{ Path = $Path; New = $New; Update = $Update; Rename = $Rename; Nrpt = $Nrpt; Name = $Name; WhatIf = $WhatIfPreference }
             if ($PSBoundParameters.ContainsKey('Confirm')) { $operationParameters['Confirm'] = $Confirm }
             Invoke-NRAdopt @operationParameters
         }

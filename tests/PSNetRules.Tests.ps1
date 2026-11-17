@@ -5384,3 +5384,182 @@ Describe 'PSNetRules search through the command-line entry point' {
         $result.StandardOutput | Should-MatchString '1 matched'
     }
 }
+
+Describe 'PSNetRules NRPT adoption' {
+    BeforeEach {
+        Mock New-NRFileBackup -ModuleName PSNetRules { @() }
+    }
+
+    It 'adopts a captured NRPT rule under its GUID id without touching the state file' {
+        Mock New-NRFileBackup -ModuleName PSNetRules { @('nrpt-backup-path') }
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'adopt-nrpt.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid -Namespace @('.web.nhk') -Server '0.0.0.0' -DisplayName 'Block web.nhk'))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+        $statePath = Get-NRStatePath -Path $path
+        Write-NRStateFile -Path $statePath -State ([pscustomobject]@{ nrptRules = @{ 'corp-dns' = '{11111111-2222-3333-4444-555555555555}' }; managedFirewallRules = @() })
+        $stateBefore = Get-Content -LiteralPath $statePath -Raw
+
+        $result = @(Invoke-NRAdopt -Path $path -Nrpt -Name $guid -Confirm:$false) -join [Environment]::NewLine
+
+        $result | Should-MatchString 'NRPT rules to adopt: 1'
+        $result | Should-MatchString 'Block web\.nhk'
+        $result | Should-MatchString 'Backup: nrpt-backup-path'
+        $result | Should-MatchString 'Adopted 1 NRPT rules\.'
+        $rules = @((Read-NRConfiguration -Path $path).nrptRules)
+        $rules.Count | Should-Be 1
+        $rules[0].id | Should-Be $guid
+        $rules[0].Namespace | Should-BeCollection @('.web.nhk')
+        $rules[0].NameServers | Should-BeCollection @('0.0.0.0')
+        $rules[0].DisplayName | Should-Be 'Block web.nhk'
+        (Get-Content -LiteralPath $statePath -Raw) | Should-Be $stateBefore
+    }
+
+    It 'adopts multiple NRPT rules and keeps desired sorted by id' {
+        $path = Join-Path $TestDrive 'adopt-nrpt-multi.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @(
+            (New-NRFixtureNrptRuleRecord -Id '{BBBBBBBB-0000-0000-0000-000000000002}' -Namespace @('b.example')),
+            (New-NRFixtureNrptRuleRecord -Id '{AAAAAAAA-0000-0000-0000-000000000001}' -Namespace @('a.example'))
+        )
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+
+        $result = @(Invoke-NRAdopt -Path $path -Nrpt -Name '{BBBBBBBB-0000-0000-0000-000000000002}', '{AAAAAAAA-0000-0000-0000-000000000001}', '{BBBBBBBB-0000-0000-0000-000000000002}' -Confirm:$false) -join [Environment]::NewLine
+
+        $result | Should-MatchString 'Adopted 2 NRPT rules\.'
+        $ids = @((Read-NRConfiguration -Path $path).nrptRules | ForEach-Object { $_.id })
+        $ids | Should-BeCollection @('{AAAAAAAA-0000-0000-0000-000000000001}', '{BBBBBBBB-0000-0000-0000-000000000002}')
+    }
+
+    It 'updates an adopted NRPT rule from the latest capture' {
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'adopt-nrpt-update.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid -Namespace @('.web.nhk') -Server '0.0.0.0'))
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid -Namespace @('.web.nhk') -Server '127.0.0.1'))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+
+        $result = @(Invoke-NRAdopt -Path $path -Nrpt -Update -Name $guid -Confirm:$false) -join [Environment]::NewLine
+
+        $result | Should-MatchString 'NRPT rules to update: 1'
+        $result | Should-MatchString 'Updated 1 NRPT rules\.'
+        $rules = @((Read-NRConfiguration -Path $path).nrptRules)
+        $rules.Count | Should-Be 1
+        $rules[0].NameServers | Should-BeCollection @('127.0.0.1')
+    }
+
+    It 'rejects adopting an already managed NRPT rule without Update' {
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'adopt-nrpt-duplicate.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid))
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+
+        { Invoke-NRAdopt -Path $path -Nrpt -Name $guid -Confirm:$false } |
+            Should-Throw "*NRPT rule '$guid' is already managed*"
+    }
+
+    It 'rejects updating an NRPT rule that is not managed' {
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'adopt-nrpt-update-missing.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+
+        { Invoke-NRAdopt -Path $path -Nrpt -Update -Name $guid -Confirm:$false } |
+            Should-Throw "*NRPT rule '$guid' is not currently managed*"
+    }
+
+    It 'rejects an NRPT id that is not in the capture snapshot' {
+        $path = Join-Path $TestDrive 'adopt-nrpt-unknown.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration (New-NRFixtureConfiguration))
+
+        { Invoke-NRAdopt -Path $path -Nrpt -Name '{99999999-9999-9999-9999-999999999999}' -Confirm:$false } |
+            Should-Throw "*is not present in the latest capture snapshot*"
+    }
+
+    It 'rejects bulk adoption, renaming, and a missing Name for NRPT rules' {
+        $path = Join-Path $TestDrive 'adopt-nrpt-args.json'
+        Write-NRJsonFile -Path $path -InputObject (New-NRFixtureConfiguration)
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration (New-NRFixtureConfiguration))
+
+        { Invoke-NRAdopt -Path $path -Nrpt -New -Confirm:$false } |
+            Should-Throw '*Bulk adoption (-New) is not supported for NRPT rules*'
+        { Invoke-NRAdopt -Path $path -Nrpt -Rename -Name 'corp-dns' -Confirm:$false } |
+            Should-Throw '*-Rename is not supported for NRPT rules*'
+        { Invoke-NRAdopt -Path $path -Nrpt -Confirm:$false } |
+            Should-Throw '*Adopting NRPT rules requires -Name*'
+        { Invoke-NRAdopt -Path $path -Nrpt -Name '', 'corp-dns' -Confirm:$false } |
+            Should-Throw '*NRPT rule id cannot be empty*'
+    }
+
+    It 'reports when there are no NRPT rules to adopt' {
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        $snapshot = New-NRFixtureCaptureSnapshot -Configuration (New-NRFixtureConfiguration)
+
+        $result = Invoke-NRPrivateFunction -Name Invoke-NRAdoptNrpt -Parameters @{
+            Path = (Join-Path $TestDrive 'unused.json'); Desired = $desired
+            Snapshot = $snapshot; Update = $false; Names = @()
+        }
+
+        $result | Should-Be 'No NRPT rules to adopt.'
+    }
+
+    It 'previews NRPT adoption with WhatIf without changing the desired file' {
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'adopt-nrpt-whatif.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid -Namespace @('.web.nhk') -Server '0.0.0.0'))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+        $before = Get-Content -LiteralPath $path -Raw
+
+        $result = @(Invoke-NRAdopt -Path $path -Nrpt -Name $guid -WhatIf) -join [Environment]::NewLine
+
+        $result | Should-MatchString 'NRPT rules to adopt: 1'
+        (Get-Content -LiteralPath $path -Raw) | Should-Be $before
+    }
+
+    It 'replaces only the selected records and sorts by id in the adopted NRPT configuration' {
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @(
+            (New-NRFixtureNrptRuleRecord -Id 'keep' -Namespace @('keep.example')),
+            (New-NRFixtureNrptRuleRecord -Id 'refresh' -Namespace @('old.example'))
+        )
+        $current = @{
+            'refresh' = (New-NRFixtureNrptRuleRecord -Id 'refresh' -Namespace @('new.example'))
+            'added' = (New-NRFixtureNrptRuleRecord -Id 'added' -Namespace @('added.example'))
+        }
+
+        $updated = Invoke-NRPrivateFunction -Name Set-NRAdoptedNrptConfiguration -Parameters @{
+            Desired = $desired; Ids = @('refresh', 'added'); CurrentById = $current
+        }
+
+        $ids = @($updated.Desired.nrptRules | ForEach-Object { $_.id })
+        $ids | Should-BeCollection @('added', 'keep', 'refresh')
+        ($updated.Desired.nrptRules | Where-Object { $_.id -eq 'refresh' }).Namespace |
+            Should-BeCollection @('new.example')
+    }
+
+}
