@@ -102,7 +102,7 @@ $invokeParameters['Command'] = $arguments[0]
 $argumentIndex = 1
 }
 
-$switchParameterNames = @('Force', 'New', 'Update', 'Rename', 'WhatIf', 'Confirm', 'Enabled', 'Disabled', 'MissingProgram')
+$switchParameterNames = @('Force', 'New', 'Update', 'Rename', 'WhatIf', 'Confirm', 'Enabled', 'Disabled', 'MissingProgram', 'Nrpt')
 $valueParameterNames = @('Command', 'Path', 'Name', 'OutputPath', 'Status', 'Source', 'Text', 'Direction', 'Action', 'Profile', 'NamePattern', 'Program', 'Service', 'Protocol', 'LocalPort', 'RemotePort', 'LocalAddress', 'RemoteAddress', 'Sid')
 while ($argumentIndex -lt $arguments.Count) {
 $token = $arguments[$argumentIndex]

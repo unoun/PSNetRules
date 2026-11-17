@@ -3273,6 +3273,31 @@ Describe 'PSNetRules top-level command-line entry point' {
         $result.Output | Should-MatchString '-New, -Update, and -Rename are supported only by adopt.'
     }
 
+    It 'rejects Nrpt outside adopt' {
+        $result = Invoke-NRRootScriptInChildProcess -Arguments @('validate', '-Nrpt')
+        $result.ExitCode | Should-Be 1
+        $result.Output | Should-MatchString '-Nrpt is supported only by adopt.'
+    }
+
+    It 'routes NRPT adoption through the command-line entry point' {
+        $guid = '{F8B4324F-A698-4BBB-A153-12F651B64F2F}'
+        $path = Join-Path $TestDrive 'entrypoint-adopt-nrpt.json'
+        $desired = New-NRFixtureConfiguration
+        $desired.nrptRules = @()
+        Write-NRJsonFile -Path $path -InputObject $desired
+        $captured = New-NRFixtureConfiguration
+        $captured.nrptRules = @((New-NRFixtureNrptRuleRecord -Id $guid -Namespace @('.web.nhk') -Server '0.0.0.0' -DisplayName 'Block web.nhk'))
+        Write-NRJsonFile -Path (Get-NRSnapshotPath -Path $path) -InputObject (New-NRFixtureCaptureSnapshot -Configuration $captured)
+        $before = Get-Content -LiteralPath $path -Raw
+
+        $result = Invoke-NRRootScriptInChildProcess -Arguments @('adopt', '-Path', $path, '-Nrpt', '-Name', $guid, '-WhatIf')
+
+        Assert-NRChildProcessSuccess -Result $result -Context 'CLI NRPT adopt'
+        $result.Output | Should-MatchString 'NRPT rules to adopt: 1'
+        $result.Output | Should-MatchString 'Block web\.nhk'
+        (Get-Content -LiteralPath $path -Raw) | Should-Be $before
+    }
+
     It 'allows Name only for adopt and unmanage' {
         $result = Invoke-NRRootScriptInChildProcess -Arguments @('validate', '-Name', 'Rule-A')
         $result.ExitCode | Should-Be 1
